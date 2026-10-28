@@ -1,11 +1,10 @@
 # Exynos 2200 (b0s / Galaxy S22 Ultra) mainline Linux 6.17 series
 # Base: vanilla linux-6.17
 #
-# Apply order. "upstream" = shaped for submission; "local" = needed to boot this
-# device but not intended as-is for upstream; "lab" = measurement/debug only.
+# Apply order. "upstream" = shaped for submission. Every patch listed here is
+# in this directory and the set applies cleanly with `git am` on vanilla 6.17.
 #
 # number  status    file
-0001-dwc3-core-exynos2200-kexec-fixes.patch              local   # DEBUG-heavy; extract the CSFTRST timeout fix before sending
 0002-phy-samsung-ufs-add-Exynos-2200-UFS-PHY.patch       upstream
 0003-scsi-ufs-exynos-add-Exynos-2200-variant.patch       upstream
 0004-phy-exynos5-usbdrd-make-Exynos-2200-USB-3-work.patch upstream
@@ -13,5 +12,16 @@
 0006-phy-samsung-exynos2200-usbdp-clean-USBDP-combo-PHY-b.patch upstream
 0007-arm64-dts-exynos2200-add-b0s-S22-Ultra-and-its-kexec.patch upstream
 0008-b0s-take-USBDP-eUSB2-reset-ACPM-and-DPU-addresses-fr.patch upstream
-0009-bench-kx-b0s-boot-deep-idle-gate-latency-QoS-0-until.patch  lab     # measurement only - do not submit
-0001-bench-earlycon-kxram-early-console-into-a-no-map-RAM.patch   local   # early console for debugging
+#
+# Numbering starts at 0002 because 0001 was a debug-only dwc3 patch that has
+# been dropped (see below).
+#
+# Not published here (local debugging aids, not needed to apply or boot):
+#   bench: earlycon-kxram - early console into a no-map RAM carve-out
+#   bench: kx-b0s-boot deep-idle gate (latency QoS 0) - measurement only
+#
+# Dropped: dwc3 "CSFTRST timeout" patch. It was instrumentation, not a fix.
+# With 0004/0006/0008 applied (HSP_MISC RES_TUNE cleared before set, eUSB2
+# RST_CTRL, USBDP RAM boot), DCTL.CSFTRST clears inside the stock dwc3 poll
+# window with drivers/usb/dwc3 unmodified - measured on the device (k1b209,
+# k1b232b). No dwc3 change is required for this board.
