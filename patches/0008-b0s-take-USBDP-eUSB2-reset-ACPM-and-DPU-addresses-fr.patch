@@ -1,0 +1,659 @@
+From 70c31ecb2b721ef717eb14b83ee1326d5c997403 Mon Sep 17 00:00:00 2001
+From: hacen <hacenbm144@gmail.com>
+Date: Fri, 9 Oct 2026 18:02:28 +0000
+Subject: [PATCH 8/9] b0s: take USBDP, eUSB2 reset, ACPM and DPU addresses from
+ the device tree
+
+- new node samsung,exynos2200-usbdp-phy (ctrl/tca, pmu, cmu-hsi0), referenced by
+  the DRD PHY as samsung,usbdp-phy; eUSB2 reset register from the eUSB2 PHY node
+- kx-b0s-boot: /chosen/kexec-boot node (reg-names, pmu syscon, memory-region,
+  framebuffer); fb size and carve-out from DT
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../boot/dts/exynos/exynos2200-b0s-kx.dts     |  51 ++-
+ drivers/phy/samsung/phy-exynos2200-usbdp.c    |  53 ++--
+ drivers/phy/samsung/phy-exynos5-usbdrd.c      |  21 +-
+ drivers/soc/samsung/kx-b0s-boot.c             | 293 ++++++++++--------
+ 4 files changed, 265 insertions(+), 153 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/exynos/exynos2200-b0s-kx.dts b/arch/arm64/boot/dts/exynos/exynos2200-b0s-kx.dts
+index a911629d6..f31ebd652 100755
+--- a/arch/arm64/boot/dts/exynos/exynos2200-b0s-kx.dts
++++ b/arch/arm64/boot/dts/exynos/exynos2200-b0s-kx.dts
+@@ -93,7 +93,7 @@ chosen {
+ 			    0x91e3d48c 0x6df185e5 0x5930ec18 0x5990dc88 0xd9099c31 0x8b6cdadb 0xf2f8012d 0x5f4f0449>;
+ 
+ 		/* the DPU scans out kx_fb (k1b221); simpledrm + fbcon draw into it */
+-		framebuffer@d0000000 {
++		kx_simplefb: framebuffer@d0000000 {
+ 			compatible = "simple-framebuffer";
+ 			reg = <0x0 0xd0000000 0x0 0x10f6800>;
+ 			width = <1440>;
+@@ -105,7 +105,7 @@ framebuffer@d0000000 {
+ 	};
+ 
+ 	reserved-memory {
+-		kx_fb@d0000000 { reg = <0x0 0xd0000000 0x0 0x2000000>; no-map; };
++		kx_fb: kx_fb@d0000000 { reg = <0x0 0xd0000000 0x0 0x2000000>; no-map; };
+ 	};
+ };
+ 
+@@ -164,3 +164,50 @@ &usb_dwc3 {
+ 	/delete-property/ usb-role-switch;
+ 	/delete-property/ role-switch-default-mode;
+ };
++
++/* ---- k1b235: addresses the kernel used to hard-code ---- */
++
++/ {
++	chosen {
++		/*
++		 * kexec bring-up helpers (drivers/soc/samsung/kx-b0s-boot.c). Under /chosen so no
++		 * platform device claims these windows.
++		 */
++		kexec-boot@2060000 {
++			compatible = "samsung,b0s-kexec-boot";
++			reg = <0x0 0x02060000 0x0 0x50000>,
++			      <0x0 0x15900000 0x0 0x1000>,
++			      <0x0 0x19f00000 0x0 0x1000>,
++			      <0x0 0x19f10000 0x0 0x10000>,
++			      <0x0 0x19f30000 0x0 0x10000>,
++			      <0x0 0x1ad0e000 0x0 0x1000>,
++			      <0x0 0x1ad00000 0x0 0x8000>,
++			      <0x0 0x1af00000 0x0 0x8000>,
++			      <0x0 0x1ac40000 0x0 0x10000>,
++			      <0x0 0x1ac50000 0x0 0x10000>,
++			      <0x0 0x1ae40000 0x0 0x10000>,
++			      <0x0 0x1ae50000 0x0 0x10000>;
++			reg-names = "acpm-sram", "apm-mbox", "decon", "decon-win", "decon-wincon",
++				    "dqe-edma", "dpp-dma-a", "dpp-dma-b",
++				    "sysmmu0", "sysmmu1", "sysmmu2", "sysmmu3";
++			samsung,pmu-syscon = <&pmu_system_controller>;
++			memory-region = <&kx_fb>;
++			framebuffer = <&kx_simplefb>;
++		};
++	};
++};
++
++&{/soc} {
++	usbdp_phy: phy@10ad0000 {
++		compatible = "samsung,exynos2200-usbdp-phy";
++		reg = <0x0 0x10ad0000 0x0 0x1000>,
++		      <0x0 0x10ae0000 0x0 0x100>;
++		reg-names = "ctrl", "tca";
++		samsung,pmu-syscon = <&pmu_system_controller>;
++		samsung,cmu-hsi0 = <&cmu_hsi0>;
++	};
++};
++
++&usb32drd {
++	samsung,usbdp-phy = <&usbdp_phy>;
++};
+diff --git a/drivers/phy/samsung/phy-exynos2200-usbdp.c b/drivers/phy/samsung/phy-exynos2200-usbdp.c
+index c7b39fd86..5d6fb75f1 100755
+--- a/drivers/phy/samsung/phy-exynos2200-usbdp.c
++++ b/drivers/phy/samsung/phy-exynos2200-usbdp.c
+@@ -7,8 +7,11 @@
+  * Called from the PIPE3 instance init of phy-exynos5-usbdrd; the DWC3 core
+  * soft reset needs the pipe clock that this PHY's PLL provides.
+  *
+- * TODO for upstream: take the bases, the PMU syscon and the Q-channel
+- * register from DT instead of fixed addresses.
++ * DT node (compatible "samsung,exynos2200-usbdp-phy"), referenced from the USB
++ * DRD PHY by "samsung,usbdp-phy":
++ *   reg / reg-names     "ctrl" (CR_PARA control), "tca" (Type-C assist)
++ *   samsung,pmu-syscon  PMU (USBDP isolation at 0x730)
++ *   samsung,cmu-hsi0    CMU_HSI0 (Q-channel of the USB link at 0x3064)
+  */
+ #include <linux/bits.h>
+ #include <linux/delay.h>
+@@ -16,13 +19,11 @@
+ #include <linux/io.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/printk.h>
+ #include <linux/regmap.h>
+ 
+-#define USBDP_CTRL_BASE		0x10ad0000UL
+-#define USBDP_TCA_BASE		0x10ae0000UL
+-#define CMU_HSI0_QCH_BASE	0x10a03000UL
+-#define QCH_CON_S_LINK		0x64
++#define CMU_HSI0_QCH_CON_S_LINK	0x3064
+ #define PMU_USBDP_PHY_CTRL	0x730
+ 
+ /* CR_PARA control block */
+@@ -157,32 +158,31 @@ static u16 cr_read(u16 addr)
+ 	return (u16)(rd(CR_PARA_CON1) >> 16);
+ }
+ 
+-static void qch_link_on(void)
++static void qch_link_on(struct device_node *np)
+ {
+-	void __iomem *c = ioremap(CMU_HSI0_QCH_BASE, 0x100);
++	struct device_node *cmu = of_parse_phandle(np, "samsung,cmu-hsi0", 0);
++	void __iomem *c = cmu ? of_iomap(cmu, 0) : NULL;
+ 	u32 v;
+ 
+-	if (!c)
++	of_node_put(cmu);
++	if (!c) {
++		pr_warn("exynos2200-usbdp: no samsung,cmu-hsi0 - Q-channel left as is\n");
+ 		return;
+-	v = readl(c + QCH_CON_S_LINK);
++	}
++	v = readl(c + CMU_HSI0_QCH_CON_S_LINK);
+ 	if (!(v & BIT(0))) {		/* manual mode: CLOCK_REQ = 1 */
+-		writel(v | BIT(1), c + QCH_CON_S_LINK);
++		writel(v | BIT(1), c + CMU_HSI0_QCH_CON_S_LINK);
+ 		udelay(10);
+ 	}
+ 	iounmap(c);
+ }
+ 
+-static int release_isolation(void)
++static int release_isolation(struct device_node *np)
+ {
+-	struct device_node *np;
+ 	struct regmap *pmu;
+ 	int ret;
+ 
+-	np = of_find_compatible_node(NULL, NULL, "samsung,exynos2200-usb32drd-phy");
+-	if (!np)
+-		return -ENODEV;
+ 	pmu = syscon_regmap_lookup_by_phandle(np, "samsung,pmu-syscon");
+-	of_node_put(np);
+ 	if (IS_ERR(pmu))
+ 		return PTR_ERR(pmu);
+ 	ret = regmap_update_bits(pmu, PMU_USBDP_PHY_CTRL, BIT(0), BIT(0));
+@@ -212,25 +212,34 @@ static int tca_usb_mode(void __iomem *tca)
+ 	return 0;
+ }
+ 
+-int exynos2200_usbdp_boot(void)
++static void __iomem *map_named(struct device_node *np, const char *name)
++{
++	int i = of_property_match_string(np, "reg-names", name);
++
++	return i < 0 ? NULL : of_iomap(np, i);
++}
++
++int exynos2200_usbdp_boot(struct device_node *np)
+ {
+ 	void __iomem *tca;
+ 	unsigned int n, t;
+ 	int ret, ackmiss = 0;
+ 	u16 cal = 0;
+ 
+-	qch_link_on();
++	if (!np)
++		return -ENODEV;
++	qch_link_on(np);
+ 
+-	ctrl = ioremap(USBDP_CTRL_BASE, 0x300);
++	ctrl = map_named(np, "ctrl");
+ 	if (!ctrl)
+ 		return -ENOMEM;
+-	tca = ioremap(USBDP_TCA_BASE, 0x100);
++	tca = map_named(np, "tca");
+ 	if (!tca) {
+ 		ret = -ENOMEM;
+ 		goto out_ctrl;
+ 	}
+ 
+-	ret = release_isolation();
++	ret = release_isolation(np);
+ 	if (ret)
+ 		pr_warn("exynos2200-usbdp: PMU isolation release failed: %d\n", ret);
+ 
+diff --git a/drivers/phy/samsung/phy-exynos5-usbdrd.c b/drivers/phy/samsung/phy-exynos5-usbdrd.c
+index dad36ca9c..d1520bb99 100644
+--- a/drivers/phy/samsung/phy-exynos5-usbdrd.c
++++ b/drivers/phy/samsung/phy-exynos5-usbdrd.c
+@@ -15,6 +15,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/iopoll.h>
+ #include <linux/phy/phy.h>
+ #include <linux/platform_device.h>
+@@ -1302,7 +1303,7 @@ static const struct phy_ops exynos7870_usbdrd_phy_ops = {
+ 	.owner		= THIS_MODULE,
+ };
+ 
+-#define EXYNOS2200_EUSB2_RST_CTRL		0x10ab0000
++#define EUSB2_RST_CTRL			0x0
+ #define EUSB2_RST_CTRL_PHY_RESET		BIT(0)
+ #define EUSB2_RST_CTRL_PHY_RESET_OVRD_EN	BIT(1)
+ 
+@@ -1318,24 +1319,30 @@ static void exynos2200_usbdrd_utmi_init(struct exynos5_usbdrd_phy *phy_drd)
+ 	 * Keep the eUSB2 PHY reset owned by its register (as the vendor kernel
+ 	 * does), so the DWC3 core soft reset cannot reset the eUSB2 PHY and stop
+ 	 * utmi_clk underneath itself.
+-	 * TODO: belongs in the eUSB2 PHY driver / a DT reg entry.
++	 * The register is the first word of the eUSB2 PHY's own DT region.
+ 	 */
+-	rst = ioremap(EXYNOS2200_EUSB2_RST_CTRL, 4);
++	if (IS_ERR_OR_NULL(phy_drd->hs_phy))
++		return;
++	rst = of_iomap(phy_drd->hs_phy->dev.of_node, 0);
+ 	if (!rst)
+ 		return;
+-	reg = readl(rst);
++	reg = readl(rst + EUSB2_RST_CTRL);
+ 	reg &= ~EUSB2_RST_CTRL_PHY_RESET;
+ 	reg |= EUSB2_RST_CTRL_PHY_RESET_OVRD_EN;
+-	writel(reg, rst);
++	writel(reg, rst + EUSB2_RST_CTRL);
+ 	iounmap(rst);
+ }
+ 
+ /* SNPS USBDP combo PHY (RAM-mode SRAM firmware) bring-up, phy-exynos2200-usbdp.c */
+-int exynos2200_usbdp_boot(void);
++int exynos2200_usbdp_boot(struct device_node *np);
+ 
+ static void exynos2200_usbdrd_pipe3_init(struct exynos5_usbdrd_phy *phy_drd)
+ {
+-	int ret = exynos2200_usbdp_boot();
++	struct device_node *np = of_parse_phandle(phy_drd->dev->of_node,
++						  "samsung,usbdp-phy", 0);
++	int ret = exynos2200_usbdp_boot(np);
++
++	of_node_put(np);
+ 
+ 	if (ret)
+ 		dev_err(phy_drd->dev, "USBDP combo PHY boot failed: %d\n", ret);
+diff --git a/drivers/soc/samsung/kx-b0s-boot.c b/drivers/soc/samsung/kx-b0s-boot.c
+index 4e39158e7..0b3e7c85c 100755
+--- a/drivers/soc/samsung/kx-b0s-boot.c
++++ b/drivers/soc/samsung/kx-b0s-boot.c
+@@ -1,35 +1,50 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+- * kx-b0s-boot - built-in bring-up helpers for the Samsung Galaxy S22 Ultra (b0s, Exynos 2200)
+- * when mainline Linux is started by kexec from the stock Android kernel (k1b230).
++ * kx-b0s-boot - bring-up helpers for the Samsung Galaxy S22 Ultra (b0s, Exynos 2200) when mainline
++ * Linux is started by kexec from the stock Android kernel.
+  *
+- * Bench code, NOT upstream material: fixed addresses, no DT bindings. It replaces the out-of-tree
+- * kxpmic.ko (k1b228) and kxdpu.ko (k1b222) with identical logic, run at fixed initcall levels:
++ * Everything comes from the DT node compatible "samsung,b0s-kexec-boot":
++ *   reg / reg-names   acpm-sram, apm-mbox, decon, decon-win, decon-wincon, dqe-edma,
++ *                     dpp-dma-a (ch 0-7), dpp-dma-b (ch 8-15), sysmmu0..3
++ *   samsung,pmu-syscon   PMU (DPU power-domain status)
++ *   memory-region        the no-map carve-out the DPU scans out (fb, then dummy page + sysmmu table)
++ *   framebuffer          the simple-framebuffer node (width/height)
+  *
+- *  subsys_initcall  kx_b0s_pmic: ACPM (APM SRAM 0x02060000 + initdata 0xF800, channel 2, doorbell
+- *                   BIT(2) << 16 -> 0x15900008) - whitelist of six PMIC rails; per rail the voltage
+- *                   field must equal Android's, then ONLY the enable field [7:6] is set to 0b11.
+- *                   Android's kexec shutdown clears the UFS LDO18/19 enables (VCC 2.55 V / VCCQ 1.2 V);
+- *                   the USB rails stay on. Runs before any driver probe, so UFS finds its supplies on.
+- *  late_initcall_sync kx_b0s_dpu: the DPU left running by the host (kxdispkeep + kxdpuwake4) is pointed at
+- *                   the simple-framebuffer at PA 0xD0000000 through our own sysmmu table at 0xD1F00000
+- *                   (DQE + CGC EDMA off, full-screen window auto-detected, ARGB8888 linear, COPY blend).
+- * Both only run on "samsung,b0s".
++ *  subsys_initcall  PMIC: over ACPM channel 2, a whitelist of six rails; per rail the voltage field
++ *                   must equal Android's, then ONLY the enable field [7:6] is set. Android's kexec
++ *                   shutdown clears the UFS LDO18/19 enables; runs before any driver probe.
++ *  late_initcall_sync DPU: the display pipeline left running by the host is pointed at the
++ *                   simple-framebuffer through our own sysmmu table (DQE + EDMA off, full-screen
++ *                   window auto-detected, ARGB8888 linear, COPY blend).
+  */
+-#include <linux/module.h>
+-#include <linux/kernel.h>
++#include <linux/delay.h>
+ #include <linux/init.h>
+ #include <linux/io.h>
+-#include <linux/of.h>
+-#include <linux/delay.h>
++#include <linux/kernel.h>
+ #include <linux/ktime.h>
++#include <linux/mfd/syscon.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_reserved_mem.h>
++#include <linux/regmap.h>
+ #include <linux/string.h>
+ 
++#define KX_COMPAT	"samsung,b0s-kexec-boot"
++
++static void __iomem *__init kx_map(struct device_node *np, const char *name, resource_size_t *sz)
++{
++	struct resource r;
++	int i = of_property_match_string(np, "reg-names", name);
++
++	if (i < 0 || of_address_to_resource(np, i, &r))
++		return NULL;
++	if (sz)
++		*sz = resource_size(&r);
++	return ioremap(r.start, resource_size(&r));
++}
++
+ /* ------------------------------------------------------------------ PMIC via ACPM */
+-#define SRAM_PA		0x02060000
+-#define SRAM_SZ		0x50000
+ #define INITDATA	0xF800
+-#define MBOX_PA		0x15900000
+ #define MBOX_INTGR0	0x08
+ #define ACPM_CH		2
+ #define PMIC_BANK	5
+@@ -45,6 +60,7 @@ static const struct kx_rail kx_rails[] __initconst = {
+ };
+ 
+ static void __iomem *kx_sram, *kx_mbox;
++static resource_size_t kx_sram_sz;
+ static u32 kx_qlen, kx_mlen, kx_txr, kx_txf, kx_txb, kx_rxr, kx_rxf, kx_rxb;
+ static u8 kx_seq;
+ 
+@@ -87,19 +103,24 @@ static int __init kx_acpm_xfer(u8 sid, u8 reg, bool write, u8 wval, u8 *rval)
+ 
+ static int __init kx_b0s_pmic(void)
+ {
++	struct device_node *np;
+ 	u32 chans, nch, i;
+ 	void __iomem *c;
+ 	int on = 0;
+ 
+-	if (!of_machine_is_compatible("samsung,b0s"))
++	np = of_find_compatible_node(NULL, NULL, KX_COMPAT);
++	if (!np)
+ 		return 0;
+-	kx_sram = ioremap(SRAM_PA, SRAM_SZ);
+-	kx_mbox = ioremap(MBOX_PA, 0x1000);
+-	if (!kx_sram || !kx_mbox)
++	kx_sram = kx_map(np, "acpm-sram", &kx_sram_sz);
++	kx_mbox = kx_map(np, "apm-mbox", NULL);
++	of_node_put(np);
++	if (!kx_sram || !kx_mbox) {
++		pr_err("kx-b0s: pmic: acpm-sram/apm-mbox missing in DT\n");
+ 		goto out;
++	}
+ 	chans = readl(kx_sram + INITDATA + 8);
+ 	nch = readl(kx_sram + INITDATA + 24);
+-	if (!chans || chans >= SRAM_SZ || nch > 32 || ACPM_CH >= nch)
++	if (!chans || chans >= kx_sram_sz || nch > 32 || ACPM_CH >= nch)
+ 		goto bad;
+ 	for (i = 0; i < nch; i++) {
+ 		c = kx_sram + chans + i * 72;
+@@ -110,7 +131,8 @@ static int __init kx_b0s_pmic(void)
+ 		kx_qlen = readl(c + 52); kx_mlen = readl(c + 56);
+ 		break;
+ 	}
+-	if (!kx_qlen || kx_qlen > 64 || kx_mlen < 16 || kx_mlen > 64 || kx_rxb >= SRAM_SZ || kx_txb >= SRAM_SZ)
++	if (!kx_qlen || kx_qlen > 64 || kx_mlen < 16 || kx_mlen > 64 ||
++	    kx_rxb >= kx_sram_sz || kx_txb >= kx_sram_sz)
+ 		goto bad;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(kx_rails); i++) {
+@@ -126,15 +148,16 @@ static int __init kx_b0s_pmic(void)
+ 			continue;
+ 		}
+ 		if ((en & 0x3f) != rl->low || (rl->vreg && vs != rl->vval)) {
+-			pr_err("kx-b0s: pmic %s en=%#04x vsel=%#04x differs from Android - NOT written\n", rl->name, en, vs);
++			pr_err("kx-b0s: pmic %s en=%#04x vsel=%#04x differs from Android - NOT written\n",
++			       rl->name, en, vs);
+ 			continue;
+ 		}
+ 		if ((en & 0xc0) != 0xc0)
+ 			w = kx_acpm_xfer(rl->sid, rl->en, true, (en & 0x3f) | 0xc0, NULL);
+ 		udelay(300);
+ 		kx_acpm_xfer(rl->sid, rl->en, false, 0, &after);
+-		pr_info("kx-b0s: pmic %-14s sid%u %#04x: %#04x -> %#04x (w %d)%s\n", rl->name, rl->sid, rl->en, en,
+-			after, w, (after & 0xc0) == 0xc0 ? " ON" : " NOT ON");
++		pr_info("kx-b0s: pmic %-14s sid%u %#04x: %#04x -> %#04x (w %d)%s\n", rl->name, rl->sid,
++			rl->en, en, after, w, (after & 0xc0) == 0xc0 ? " ON" : " NOT ON");
+ 		if ((after & 0xc0) == 0xc0)
+ 			on++;
+ 	}
+@@ -153,126 +176,152 @@ static int __init kx_b0s_pmic(void)
+ subsys_initcall(kx_b0s_pmic);
+ 
+ /* ------------------------------------------------------------------ DPU -> simple-framebuffer */
+-#define PMU_PD_DPUB_ST	0x15862084
+-#define PMU_PD_DPUF_ST	0x15862104
+-#define DECON_MAIN	0x19F00000
+-#define DECON_WIN	0x19F10000
+-#define DECON_WINCON	0x19F30000
+-#define DQE_EDMA	0x1AD0E000
+-#define FB_PA		0xD0000000UL
+-#define DUMMY_PA	0xD1E00000UL
+-#define FLPT_PA		0xD1F00000UL
+-#define FB_IOVA		0x10000000UL
+-#define FB_W		1440
+-#define FB_H		3088
+-#define FB_NSEC		18
+-
+-static const unsigned long kx_mmus[] __initconst = { 0x1AC40000, 0x1AC50000, 0x1AE40000, 0x1AE50000 };
+-
+-static unsigned long __init kx_ch_dma(unsigned int ch)
+-{
+-	if (ch <= 7)
+-		return 0x1AD00000 + ch * 0x1000;
+-	if (ch <= 14)
+-		return 0x1AF00000 + (ch - 8) * 0x1000;
+-	if (ch == 15)
+-		return 0x1AF07000;
+-	return 0;
+-}
+-
+-static u32 __init kx_rd(unsigned long pa)
+-{
+-	void __iomem *p = ioremap(pa, 4);
+-	u32 v;
+-
+-	if (!p)
+-		return 0xdeadbeef;
+-	v = readl(p);
+-	iounmap(p);
+-	return v;
+-}
+-
+-static void __init kx_wr(unsigned long pa, u32 v)
+-{
+-	void __iomem *p = ioremap(pa, 4);
+-
+-	if (!p)
+-		return;
+-	writel(v, p);
+-	iounmap(p);
+-}
++#define PMU_PD_DPUB_STATUS	0x2084
++#define PMU_PD_DPUF_STATUS	0x2104
++#define CARVE_DUMMY_OFF		0x1E00000	/* 1 MiB zero page all unused IOVA maps to */
++#define CARVE_FLPT_OFF		0x1F00000	/* our sysmmu first-level table (16 KiB) */
++#define FB_IOVA			0x10000000UL
+ 
+ static int __init kx_b0s_dpu(void)
+ {
+-	u32 *flpt, dpc, con, s, e;
++	void __iomem *decon = NULL, *win = NULL, *wincon = NULL, *edma = NULL, *dma[2] = { NULL, NULL };
++	void __iomem *mmu[4] = { NULL, NULL, NULL, NULL }, *d;
++	struct device_node *np, *fbn, *mrn;
++	struct reserved_mem *rmem;
++	struct regmap *pmu;
++	u32 *flpt, dpc, con, s, e, pdb = 0, pdf = 0, fb_w = 0, fb_h = 0, nsec;
++	phys_addr_t fb, dummy_pa, flpt_pa;
+ 	void *dummy;
+-	unsigned long d = 0;
+-	int i, win = -1, ch = -1;
++	int i, w = -1, ch = -1;
++	char nm[8];
+ 
+-	if (!of_machine_is_compatible("samsung,b0s"))
+-		return 0;
+-	if (kx_rd(PMU_PD_DPUB_ST) != 1 || kx_rd(PMU_PD_DPUF_ST) != 1) {
+-		pr_err("kx-b0s: dpu power domains off - display not taken over\n");
++	np = of_find_compatible_node(NULL, NULL, KX_COMPAT);
++	if (!np)
+ 		return 0;
++	pmu = syscon_regmap_lookup_by_phandle(np, "samsung,pmu-syscon");
++	if (IS_ERR(pmu) || regmap_read(pmu, PMU_PD_DPUB_STATUS, &pdb) ||
++	    regmap_read(pmu, PMU_PD_DPUF_STATUS, &pdf) || pdb != 1 || pdf != 1) {
++		pr_err("kx-b0s: dpu power domains off (%u/%u) - display not taken over\n", pdb, pdf);
++		goto put;
++	}
++	mrn = of_parse_phandle(np, "memory-region", 0);
++	rmem = mrn ? of_reserved_mem_lookup(mrn) : NULL;
++	of_node_put(mrn);
++	fbn = of_parse_phandle(np, "framebuffer", 0);
++	if (fbn) {
++		of_property_read_u32(fbn, "width", &fb_w);
++		of_property_read_u32(fbn, "height", &fb_h);
++		of_node_put(fbn);
+ 	}
+-	dummy = memremap(DUMMY_PA, 0x100000, MEMREMAP_WC);
+-	flpt = memremap(FLPT_PA, 4096 * 4, MEMREMAP_WC);
++	if (!rmem || rmem->size < CARVE_FLPT_OFF + SZ_16K || !fb_w || !fb_h) {
++		pr_err("kx-b0s: dpu memory-region/framebuffer missing in DT\n");
++		goto put;
++	}
++	fb = rmem->base;
++	dummy_pa = fb + CARVE_DUMMY_OFF;
++	flpt_pa = fb + CARVE_FLPT_OFF;
++	nsec = DIV_ROUND_UP(fb_w * fb_h * 4, SZ_1M);
++	if (fb_w * fb_h * 4 > CARVE_DUMMY_OFF) {
++		pr_err("kx-b0s: dpu framebuffer larger than the carve-out\n");
++		goto put;
++	}
++
++	decon = kx_map(np, "decon", NULL);
++	win = kx_map(np, "decon-win", NULL);
++	wincon = kx_map(np, "decon-wincon", NULL);
++	edma = kx_map(np, "dqe-edma", NULL);
++	dma[0] = kx_map(np, "dpp-dma-a", NULL);
++	dma[1] = kx_map(np, "dpp-dma-b", NULL);
++	for (i = 0; i < 4; i++) {
++		snprintf(nm, sizeof(nm), "sysmmu%d", i);
++		mmu[i] = kx_map(np, nm, NULL);
++	}
++	if (!decon || !win || !wincon || !edma || !dma[0] || !dma[1] ||
++	    !mmu[0] || !mmu[1] || !mmu[2] || !mmu[3]) {
++		pr_err("kx-b0s: dpu register map missing in DT\n");
++		goto unmap;
++	}
++
++	dummy = memremap(dummy_pa, SZ_1M, MEMREMAP_WC);
++	flpt = memremap(flpt_pa, SZ_16K, MEMREMAP_WC);
+ 	if (!dummy || !flpt) {
+ 		pr_err("kx-b0s: dpu memremap failed\n");
+-		return 0;
++		if (dummy)
++			memunmap(dummy);
++		if (flpt)
++			memunmap(flpt);
++		goto unmap;
+ 	}
+-	memset(dummy, 0, 0x100000);
++	memset(dummy, 0, SZ_1M);
+ 	for (i = 0; i < 4096; i++)
+-		flpt[i] = (u32)(DUMMY_PA >> 4) | 2;
+-	for (i = 0; i < FB_NSEC; i++)
+-		flpt[(FB_IOVA >> 20) + i] = (u32)((FB_PA + i * 0x100000UL) >> 4) | 2;
++		flpt[i] = (u32)(dummy_pa >> 4) | 2;
++	for (i = 0; i < nsec; i++)
++		flpt[(FB_IOVA >> 20) + i] = (u32)((fb + i * SZ_1M) >> 4) | 2;
+ 	wmb();
+ 	memunmap(flpt);
+ 	memunmap(dummy);
+ 
+-	kx_wr(DQE_EDMA + 0x0, 0);
+-	dpc = kx_rd(DECON_MAIN + 0x200);
+-	kx_wr(DECON_MAIN + 0x200, dpc & ~(0x7 << 12));
++	writel(0, edma);					/* DQE EDMA off */
++	dpc = readl(decon + 0x200);
++	writel(dpc & ~(0x7 << 12), decon + 0x200);		/* DATA_PATH_CON: DQE off */
+ 
+-	for (i = 0; i < ARRAY_SIZE(kx_mmus); i++) {
+-		kx_wr(kx_mmus[i] + 0x800C, FLPT_PA >> 12);
+-		kx_wr(kx_mmus[i] + 0x8010, 1);
+-		kx_wr(kx_mmus[i] + 0x64, 0xFFFFFFFF);
++	for (i = 0; i < 4; i++) {
++		writel(flpt_pa >> 12, mmu[i] + 0x800C);
++		writel(1, mmu[i] + 0x8010);
++		writel(0xFFFFFFFF, mmu[i] + 0x64);
+ 	}
+ 
+ 	for (i = 0; i < 16; i++) {
+-		con = kx_rd(DECON_WINCON + i * 0x1000);
+-		s = kx_rd(DECON_WIN + i * 0x1000 + 0xC);
+-		e = kx_rd(DECON_WIN + i * 0x1000 + 0x10);
+-		if ((con & 1) && s == 0 && e == (((FB_H - 1) << 16) | (FB_W - 1)) && win < 0) {
+-			win = i;
++		con = readl(wincon + i * 0x1000);
++		s = readl(win + i * 0x1000 + 0xC);
++		e = readl(win + i * 0x1000 + 0x10);
++		if ((con & 1) && s == 0 && e == (((fb_h - 1) << 16) | (fb_w - 1)) && w < 0) {
++			w = i;
+ 			ch = (con >> 4) & 0xF;
+ 		}
+ 	}
+-	if (win < 0 || !(d = kx_ch_dma(ch))) {
++	if (w < 0 || ch > 15) {
+ 		pr_err("kx-b0s: dpu no enabled full-screen window found\n");
+-		return 0;
++		goto unmap;
+ 	}
++	d = dma[ch / 8] + (ch % 8) * 0x1000;
+ 	for (i = 0; i < 16; i++)
+-		if (i != win)
+-			kx_wr(DECON_WINCON + i * 0x1000, 0);
+-	kx_wr(d + 0x08, 0xFF400000);
+-	kx_wr(d + 0x10, FB_W);
+-	kx_wr(d + 0x14, FB_H);
+-	kx_wr(d + 0x18, 0);
+-	kx_wr(d + 0x1C, (FB_H << 16) | FB_W);
+-	kx_wr(d + 0x40, FB_IOVA);
+-	kx_wr(d + 0x04, 0x0FFB0001);
+-	kx_wr(DECON_WIN + win * 0x1000 + 0x4, 0x00FF0100);
+-	kx_wr(DECON_WINCON + win * 0x1000, ((u32)ch << 4) | 1);
+-	kx_wr(DECON_MAIN + 0x224, 0x00FF0000);
+-	kx_wr(DECON_MAIN + 0x228, 0);
+-	kx_wr(DECON_MAIN + 0x50, 0x9000FFFF);
+-	kx_wr(DECON_MAIN + 0x30, kx_rd(DECON_MAIN + 0x30) & ~(1 << 4));
++		if (i != w)
++			writel(0, wincon + i * 0x1000);
++	writel(0xFF400000, d + 0x08);
++	writel(fb_w, d + 0x10);
++	writel(fb_h, d + 0x14);
++	writel(0, d + 0x18);
++	writel((fb_h << 16) | fb_w, d + 0x1C);
++	writel(FB_IOVA, d + 0x40);
++	writel(0x0FFB0001, d + 0x04);
++	writel(0x00FF0100, win + w * 0x1000 + 0x4);
++	writel(((u32)ch << 4) | 1, wincon + w * 0x1000);
++	writel(0x00FF0000, decon + 0x224);
++	writel(0, decon + 0x228);
++	writel(0x9000FFFF, decon + 0x50);
++	writel(readl(decon + 0x30) & ~(1 << 4), decon + 0x30);
+ 	mdelay(200);
+ 	pr_info("kx-b0s: dpu ON win%d ch%d frame=%u irq=%08x mmuint=%08x/%08x/%08x/%08x (DATA_PATH_CON %08x)\n",
+-		win, ch, kx_rd(DECON_MAIN + 0x4), kx_rd(d + 0x4), kx_rd(kx_mmus[0] + 0x60), kx_rd(kx_mmus[1] + 0x60),
+-		kx_rd(kx_mmus[2] + 0x60), kx_rd(kx_mmus[3] + 0x60), dpc);
++		w, ch, readl(decon + 0x4), readl(d + 0x4), readl(mmu[0] + 0x60), readl(mmu[1] + 0x60),
++		readl(mmu[2] + 0x60), readl(mmu[3] + 0x60), dpc);
++unmap:
++	for (i = 0; i < 4; i++)
++		if (mmu[i])
++			iounmap(mmu[i]);
++	for (i = 0; i < 2; i++)
++		if (dma[i])
++			iounmap(dma[i]);
++	if (edma)
++		iounmap(edma);
++	if (wincon)
++		iounmap(wincon);
++	if (win)
++		iounmap(win);
++	if (decon)
++		iounmap(decon);
++put:
++	of_node_put(np);
+ 	return 0;
+ }
+ late_initcall_sync(kx_b0s_dpu);
+-- 
+2.53.0
+

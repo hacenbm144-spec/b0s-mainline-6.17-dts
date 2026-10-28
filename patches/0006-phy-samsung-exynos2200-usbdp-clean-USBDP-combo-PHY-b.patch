@@ -1,0 +1,1018 @@
+From 2ec5a5276955096f7dd9ab1e1603c9c0fe647345 Mon Sep 17 00:00:00 2001
+From: hacen <hacenbm144@gmail.com>
+Date: Fri, 9 Oct 2026 17:47:50 +0000
+Subject: [PATCH 6/9] phy: samsung: exynos2200-usbdp: clean USBDP combo PHY
+ bring-up
+
+Replaces the bench kxusbdp.c (module params, ROM/TCA-only test paths,
+instrumentation) with the RAM-mode sequence only, as verified on b0s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015Zi6dy8kB9rd8PzqHkWkui
+---
+ drivers/phy/samsung/Makefile               |   2 +-
+ drivers/phy/samsung/kxusbdp.c              | 645 ---------------------
+ drivers/phy/samsung/phy-exynos2200-usbdp.c | 308 ++++++++++
+ drivers/phy/samsung/phy-exynos5-usbdrd.c   |   6 +-
+ 4 files changed, 312 insertions(+), 649 deletions(-)
+ delete mode 100644 drivers/phy/samsung/kxusbdp.c
+ create mode 100755 drivers/phy/samsung/phy-exynos2200-usbdp.c
+
+diff --git a/drivers/phy/samsung/Makefile b/drivers/phy/samsung/Makefile
+index 85c19978f..0ab70a76b 100644
+--- a/drivers/phy/samsung/Makefile
++++ b/drivers/phy/samsung/Makefile
+@@ -17,4 +17,4 @@ phy-exynos-usb2-$(CONFIG_PHY_EXYNOS5250_USB2)	+= phy-exynos5250-usb2.o
+ phy-exynos-usb2-$(CONFIG_PHY_S5PV210_USB2)	+= phy-s5pv210-usb2.o
+ obj-$(CONFIG_PHY_EXYNOS5_USBDRD)	+= phy-exynos5-usbdrd.o
+ obj-$(CONFIG_PHY_EXYNOS5250_SATA)	+= phy-exynos5250-sata.o
+-obj-$(CONFIG_PHY_EXYNOS5_USBDRD)	+= kxusbdp.o
++obj-$(CONFIG_PHY_EXYNOS5_USBDRD)	+= phy-exynos2200-usbdp.o
+diff --git a/drivers/phy/samsung/kxusbdp.c b/drivers/phy/samsung/kxusbdp.c
+deleted file mode 100644
+index 1652863d2..000000000
+--- a/drivers/phy/samsung/kxusbdp.c
++++ /dev/null
+@@ -1,645 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-/*
+- * kxusbdp - bring up the Synopsys USBDP combo PHY for the kexec payload.
+- *
+- * Replay of the vendor's phy_exynos_snps_usbdp_phy_enable() against
+- * reg_dpphy_ctrl = 0x10ad0000 (SNPS CR_PARA control port) and
+- * reg_dpphy_tca  = 0x10ae0000.
+- *
+- * Sources, all read from the vendor tree rather than disassembled:
+- *   phy-exynos-snps-usbdp.c        phy_enable / config_mplla / phy_initiate /
+- *                                  phy_sram_ext_ld_done / cr_write
+- *   snps-usbdp-con-reg.h           every offset and bit field used below
+- *   phy-exynos-usbdrd-eusb.c:2507  base = reg_dpphy_ctrl = resource 3 = 0x10ad0000
+- *
+- * WHY: the DWC3 reset FSM clears CSFTRST only once the link's pipe clock is
+- * real.  CLKRST_LINK_PCLK_SEL selects that clock FROM the PMA - and the PMA's
+- * PLL is configured exclusively through this CR port.  Nothing in the payload
+- * has ever clocked a value through it.
+- *
+- * Load order: after phy-exynos5-usbdrd.ko, before dwc3.ko.
+- */
+-#include <linux/module.h>
+-#include <linux/io.h>
+-#include <linux/delay.h>
+-#include <linux/moduleparam.h>
+-#include <linux/of.h>
+-#include <linux/regmap.h>
+-#include <linux/mfd/syscon.h>
+-#include <linux/err.h>
+-
+-/* phy-exynos-snps-usbdp.c:39-40 - the CR addresses are LANE-RELATIVE */
+-static int kx_phy_port = 0;
+-module_param(kx_phy_port, int, 0444);
+-
+-/*
+- * KXDBG k1b155: split the module.  Steps 1-6 are the SNPS CR-port replay, and every one
+- * of them touches ctrl = 0x10ad0000 - the SuperSpeed link region, which raises SError on
+- * this silicon and panics the payload (k1b152 died at kxpd's 0x48 read; k1b153 died with
+- * this module loaded).  Step 7 is the TCA port switch at 0x10ae0000, which is what puts
+- * the port on the wire - k1b152 proved the host sees the device only when this module
+- * runs, and k1b154 proved that removing it entirely leaves the payload clean but silent.
+- *
+- *   tca_only=1  -> ONLY the TCA switch (0x10ae0000).  No access to 0x10ad0000 at all.
+- *   tca_only=0  -> the full original replay (fatal in HS mode; kept for the record).
+- */
+-static int kx_tca_only;
+-module_param(kx_tca_only, int, 0444);
+-MODULE_PARM_DESC(kx_tca_only, "1 = only the TCA port switch; never touch 0x10ad0000");
+-MODULE_PARM_DESC(kx_phy_port, "used_phy_port from DT: 0 or 1");
+-#define CRREG_LANE_TX(r) ((u16)((r) + (kx_phy_port == 0 ? 0x0000 : 0x0300)))
+-#define CRREG_LANE_RX(r) ((u16)((r) + (kx_phy_port == 0 ? 0x0100 : 0x0200)))
+-
+-#define KX_CTRL_BASE 0x10ad0000UL
+-#define KX_TCA_BASE  0x10ae0000UL
+-
+-/* snps-usbdp-con-reg.h */
+-#define RST_CTRL      0x0000
+-#define CR_PARA_CON0  0x0004
+-#define CR_PARA_CON1  0x0008
+-#define CR_PARA_CON2  0x000c
+-#define CONFIG0       0x0100
+-#define CONFIG2       0x0108
+-#define SRAM_CON      0x0110
+-
+-/* snps-usbdp-tca-reg.h - the TCA block at 0x10ae0000 */
+-#define TCA_INTR_EN   0x0004
+-#define TCA_INTR_STS  0x0008
+-#define TCA_TCPC      0x0014
+-#define TCA_INTR_XA_ACK_EN   BIT(0)
+-#define TCA_INTR_XA_TO_EN    BIT(1)
+-#define TCA_STS_XA_ACT       BIT(0)
+-#define TCPC_MUX_MASK        (0x3 << 0)
+-#define TCPC_MUX_USB31       (1 << 0)
+-#define TCPC_ORIENT          BIT(2)
+-#define TCPC_LOW_POWER       BIT(3)
+-#define TCPC_VALID           BIT(4)
+-
+-#define RST_PHY_RESET            BIT(0)
+-#define RST_PHY_RESET_OVRD_EN    BIT(1)
+-#define RST_LANE0_RESET_N        BIT(4)
+-#define RST_LANE0_RESET_N_OVRD   BIT(5)
+-
+-#define CON0_CR_PARA_SEL         BIT(0)
+-#define CON0_CR_PARA_ACK         BIT(4)
+-#define CON0_CR_PARA_CLK         BIT(8)
+-#define CON0_CR_PARA_ADDR(a)     (((a) & 0xffff) << 16)
+-
+-#define CON2_CR_PARA_WR_EN       BIT(0)
+-#define CON2_CR_PARA_WR_DATA(d)  (((d) & 0xffff) << 16)
+-
+-#define CONFIG0_ANA_PWR_EN       BIT(1)
+-#define CONFIG0_MPLLA_FORCE_EN   BIT(20)
+-#define CONFIG0_MPLLA_SSC_EN     BIT(21)
+-#define CONFIG2_TEST_POWERDOWN   BIT(24)
+-
+-#define SRAM_BYPASS              BIT(0)
+-#define SRAM_EXT_LD_DONE         BIT(1)
+-#define SRAM_INIT_DONE           BIT(2)
+-
+-/* KX178: the vendor also clears the DP TX PLL enables in the same block (DP_CONFIG12). */
+-#define DP_CONFIG12          0x0234
+-#define DP_TX_MPLL_EN_MASK   (0xf << 8)
+-
+-/* KX178: the bring-up result, readable from userspace at any time.  The kxram ring is ~40 lines
+- * and the driver's own prints are evicted long before a run ends, so a value that must survive
+- * has to live somewhere the payload's init can read late. */
+-static uint kx_step = 0, kx_cal = 0, kx_pma = 0, kx_pcs = 0, kx_fw0 = 0, kx_fw1 = 0;
+-static uint kx_rc = 0xdead;
+-module_param(kx_step, uint, 0444);
+-module_param(kx_cal, uint, 0444);
+-module_param(kx_pma, uint, 0444);
+-module_param(kx_pcs, uint, 0444);
+-module_param(kx_fw0, uint, 0444);
+-module_param(kx_fw1, uint, 0444);
+-module_param(kx_rc, uint, 0444);
+-/* KX179b: the cal block declares locals with these names; publish from outside its scope. */
+-static void kx_publish(u16 c, u16 p, u16 q, u16 f0, u16 f1)
+-{
+-	kx_cal = c; kx_pma = p; kx_pcs = q; kx_fw0 = f0; kx_fw1 = f1;
+-}
+-/* KX187: USB32DRD Q-channel (CMU_HSI0 QCH_CON) - vendor glue "aclk" = QCH_S_LINK */
+-#define KX_CMU_HSI0 0x10a00000UL
+-static int kx_noqch;
+-module_param(kx_noqch, int, 0444);
+-static uint kx_qch[6] = { 0xdead, 0xdead, 0xdead, 0xdead, 0xdead, 0xdead };
+-static int kx_nqch = 6;
+-module_param_array(kx_qch, uint, &kx_nqch, 0444);
+-static uint kx_qlink = 0xdead;
+-module_param(kx_qlink, uint, 0444);
+-static void kx_qch_link_on(void)
+-{
+-	void __iomem *c = ioremap(KX_CMU_HSI0 + 0x3000, 0x100);
+-	u32 v; int i;
+-	if (!c) { kx_qlink = 0xbad0; return; }
+-	for (i = 0; i < 6; i++)
+-		kx_qch[i] = readl(c + 0x58 + 4 * i);
+-	v = kx_qch[3];                         /* QCH_S_LINK */
+-	if (!kx_noqch && !(v & BIT(0))) {       /* vendor ra_req_enable_qch: manual mode -> CLOCK_REQ=1 */
+-		writel(v | BIT(1), c + 0x64);
+-		udelay(10);
+-	}
+-	kx_qlink = readl(c + 0x64);
+-	iounmap(c);
+-}
+-
+-/* KX185: boot on demand from the PHY driver's pipe3_init */
+-static int kx_defer = 1;
+-module_param(kx_defer, int, 0444);
+-static uint kx_boots;
+-module_param(kx_boots, uint, 0444);
+-/* KX184: RAM-mode boot (vendor PHY_RAM_MODE) */
+-static int kx_rom;
+-module_param(kx_rom, int, 0444);
+-static uint kx_fwn = 0, kx_am_fw = 0xdead, kx_ldwait = 0xdead;
+-module_param(kx_fwn, uint, 0444);
+-module_param(kx_am_fw, uint, 0444);
+-module_param(kx_ldwait, uint, 0444);
+-/* production S5E9925 (non-EVT0) phy_fw_code[], from vendor snps-usbdp-ram-code.h */
+-static const u16 kx_fw_code[][2] = {
+-	{0xC005, 0x6044},
+-	{0xC007, 0x04B3},
+-	{0xC01B, 0x7000},
+-	{0xC01C, 0x131A},
+-	{0xC023, 0x7000},
+-	{0xC024, 0x1324},
+-	{0xD31A, 0x034B},
+-	{0xD31B, 0x0001},
+-	{0xD31C, 0x080F},
+-	{0xD31D, 0x0020},
+-	{0xD31E, 0x034D},
+-	{0xD31F, 0xFFFF},
+-	{0xD320, 0x080F},
+-	{0xD321, 0xFFFF},
+-	{0xD322, 0x7000},
+-	{0xD323, 0x001D},
+-	{0xD324, 0x080F},
+-	{0xD325, 0x0020},
+-	{0xD326, 0x034D},
+-	{0xD327, 0xFFFF},
+-	{0xD328, 0x080F},
+-	{0xD329, 0xFFFF},
+-	{0xD32A, 0x1B42},
+-	{0xD32B, 0xA003},
+-	{0xD32C, 0x7000},
+-	{0xD32D, 0x002E},
+-	{0xD32E, 0x7000},
+-	{0xD32F, 0x0025},
+-	{0xD330, 0x7FFF},
+-	{0xD331, 0x7FFF},
+-};
+-/* KX183: PCS/PMA power-stable inputs (CONFIG0 bits 14/15) */
+-#define CONFIG0_PCS_PWR_STABLE   BIT(14)
+-#define CONFIG0_PMA_PWR_STABLE   BIT(15)
+-static int kx_nostable = 1;   /* KX184: vendor-faithful default */
+-module_param(kx_nostable, int, 0444);
+-static uint kx_cfg0a = 0xdead;
+-module_param(kx_cfg0a, uint, 0444);
+-/* KX181: USBDP PMU isolation (vendor pmu_offset_dp 0x730, mask BIT(0)) */
+-static int kx_noisol;
+-module_param(kx_noisol, int, 0444);
+-static uint kx_pmurc = 0xdead, kx_pmu72c = 0xdead, kx_pmu730a = 0xdead, kx_pmu730b = 0xdead;
+-module_param(kx_pmurc, uint, 0444);
+-module_param(kx_pmu72c, uint, 0444);
+-module_param(kx_pmu730a, uint, 0444);
+-module_param(kx_pmu730b, uint, 0444);
+-static void kx_release_usbdp_isol(void)
+-{
+-	struct device_node *np = of_find_compatible_node(NULL, NULL, "samsung,exynos2200-usb32drd-phy");
+-	struct regmap *pmu;
+-	int rc;
+-
+-	if (!np) { kx_pmurc = 0xbad0; return; }
+-	pmu = syscon_regmap_lookup_by_phandle(np, "samsung,pmu-syscon");
+-	of_node_put(np);
+-	if (IS_ERR(pmu)) { kx_pmurc = (uint)PTR_ERR(pmu); return; }
+-	regmap_read(pmu, 0x72c, &kx_pmu72c);
+-	regmap_read(pmu, 0x730, &kx_pmu730a);
+-	if (kx_noisol) { kx_pmurc = 0xa0; kx_pmu730b = kx_pmu730a; return; }
+-	rc = regmap_update_bits(pmu, 0x730, BIT(0), BIT(0));
+-	udelay(50);
+-	regmap_read(pmu, 0x730, &kx_pmu730b);
+-	kx_pmurc = (uint)rc;
+-}
+-
+-/* KX180: CR-port liveness discriminators */
+-static uint kx_id0 = 0, kx_id1 = 0, kx_wexp = 0, kx_wrb = 0, kx_ackmiss = 0, kx_rst = 0, kx_cfg0 = 0, kx_cfg2 = 0, kx_sram = 0, kx_con0 = 0, kx_con1 = 0;
+-module_param(kx_id0, uint, 0444);
+-module_param(kx_id1, uint, 0444);
+-module_param(kx_wexp, uint, 0444);
+-module_param(kx_wrb, uint, 0444);
+-module_param(kx_ackmiss, uint, 0444);
+-module_param(kx_rst, uint, 0444);
+-module_param(kx_cfg0, uint, 0444);
+-module_param(kx_cfg2, uint, 0444);
+-module_param(kx_sram, uint, 0444);
+-module_param(kx_con0, uint, 0444);
+-module_param(kx_con1, uint, 0444);
+-MODULE_PARM_DESC(kx_step, "KX179: last bring-up step reached (0=not started)");
+-
+-static void __iomem *ctrl;
+-static void __iomem *tca;
+-
+-/* KX191: TCA snapshot around step 7 */
+-static const u32 kx_tca_off[11] = { 0x00, 0x04, 0x08, 0x10, 0x14, 0x18, 0x30, 0x34, 0x40, 0x44, 0xfc };
+-static uint kx_tca_pre[11], kx_tca_post[11];
+-static int kx_tca_pre_n = 11, kx_tca_post_n = 11;
+-module_param_array(kx_tca_pre, uint, &kx_tca_pre_n, 0444);
+-module_param_array(kx_tca_post, uint, &kx_tca_post_n, 0444);
+-static int kx_tca_rc = 0xdead;
+-module_param(kx_tca_rc, int, 0444);
+-static void kx_tca_snap(uint *dst)
+-{
+-	int i;
+-	for (i = 0; i < 11; i++)
+-		dst[i] = tca ? readl(tca + kx_tca_off[i]) : 0xdeadbeef;
+-}
+-
+-static inline u32 kxr(u32 off) { return readl(ctrl + off); }
+-static inline void kxw(u32 val, u32 off) { writel(val, ctrl + off); }
+-
+-static void cr_clk(void __iomem *b, int high)
+-{
+-	u32 v = readl(b + CR_PARA_CON0);
+-	if (high) v |= CON0_CR_PARA_CLK; else v &= ~CON0_CR_PARA_CLK;
+-	writel(v, b + CR_PARA_CON0);
+-	udelay(1);
+-}
+-
+-/* vendor cr_port_clear(): mandatory before EVERY CR access.  Without it the port
+- * is entered with cr_para_ack still high from whatever ran before - measured as
+- * CR_PARA_CON0 = 0x00220011 (bit4 ack = 1) - and every transaction returns 0. */
+-static void kx_cr_port_clear(void)
+-{
+-	u32 reg;
+-	int i;
+-
+-	writel(0, ctrl + CR_PARA_CON1);
+-	writel(0, ctrl + CR_PARA_CON2);
+-
+-	reg = CON0_CR_PARA_SEL;          /* sel = 1, clk/ack/addr = 0 */
+-	writel(reg, ctrl + CR_PARA_CON0);
+-
+-	for (i = 0; i < 100; i++) {      /* wait for ack to fall */
+-		cr_clk(ctrl, 1);
+-		cr_clk(ctrl, 0);
+-		if (!(kxr(CR_PARA_CON0) & CON0_CR_PARA_ACK))
+-			break;
+-	}
+-	reg = kxr(CR_PARA_CON0);
+-	reg &= ~CON0_CR_PARA_CLK;
+-	writel(reg, ctrl + CR_PARA_CON0);
+-}
+-
+-static void kx_cr_write(u16 addr, u16 data)
+-{
+-	u32 con0, con2 = 0;
+-	int i;
+-
+-	kx_cr_port_clear();
+-
+-	/* CR_PARA_CON0 <- addr | clk */
+-	con0 = kxr(CR_PARA_CON0);
+-	con0 &= ~CON0_CR_PARA_ADDR(0xffff);
+-	con0 |= CON0_CR_PARA_ADDR(addr) | CON0_CR_PARA_CLK;
+-	kxw(con0, CR_PARA_CON0);
+-	cr_clk(ctrl, 0);
+-
+-	/* CR_PARA_CON2 <- data | wr_en */
+-	con2 |= CON2_CR_PARA_WR_DATA(data) | CON2_CR_PARA_WR_EN;
+-	kxw(con2, CR_PARA_CON2);
+-	cr_clk(ctrl, 1);
+-	cr_clk(ctrl, 0);
+-
+-	con2 &= ~CON2_CR_PARA_WR_EN;
+-	kxw(con2, CR_PARA_CON2);
+-
+-	/* wait ack: CON0 bit4 */
+-	for (i = 0; i < 10; i++) {
+-		cr_clk(ctrl, 1);
+-		if (kxr(CR_PARA_CON0) & CON0_CR_PARA_ACK)
+-			break;
+-		cr_clk(ctrl, 0);
+-	}
+-	if (i >= 10) kx_ackmiss += 0x10000;   /* KX180: write never acked */
+-	pr_debug("KXUDP cr_write addr=0x%04x data=0x%04x cycles=%d\n", addr, data, i);
+-}
+-
+-static void kx_phy_reset(int val)
+-{
+-	u32 v = kxr(RST_CTRL);
+-	if (val) v |= RST_PHY_RESET; else v &= ~RST_PHY_RESET;
+-	v |= RST_PHY_RESET_OVRD_EN;
+-	kxw(v, RST_CTRL);
+-	pr_debug("KXUDP phy_reset(%d) -> RST_CTRL=%08x\n", val, kxr(RST_CTRL));
+-}
+-
+-static void kx_lane0_reset(int val)
+-{
+-	u32 v = kxr(RST_CTRL);
+-	if (val) v &= ~RST_LANE0_RESET_N; else v |= RST_LANE0_RESET_N;
+-	v &= ~RST_LANE0_RESET_N_OVRD;
+-	kxw(v, RST_CTRL);
+-}
+-
+-static void kx_config_mplla(void)
+-{
+-	u32 v = kxr(CONFIG0);
+-	v |= CONFIG0_MPLLA_SSC_EN;
+-	kxw(v, CONFIG0);
+-	/* KX178: vendor phy_exynos_snps_usbdp_config_mplla() also clears dp_tx{0..3}_mpll_en;
+-	 * leaving a DisplayPort TX PLL enabled in the same PMA block can hold the common PLL. */
+-	kxw(kxr(DP_CONFIG12) & ~DP_TX_MPLL_EN_MASK, DP_CONFIG12);
+-	pr_debug("KXUDP config_mplla: CONFIG0=%08x DP_CONFIG12=%08x (ssc_en set, dp mpll off)\n",
+-		 kxr(CONFIG0), kxr(DP_CONFIG12));
+-}
+-
+-static void kx_phy_initiate(void)
+-{
+-	u32 v;
+-
+-	kx_cfg0a = kxr(CONFIG0);              /* KX183: as found */
+-	v = kx_cfg0a | CONFIG0_ANA_PWR_EN;
+-	if (!kx_nostable)                      /* KX183: as Samsung's usb3p1 KITT wrapper does */
+-		v |= CONFIG0_PCS_PWR_STABLE | CONFIG0_PMA_PWR_STABLE;
+-	kxw(v, CONFIG0);
+-	v = kxr(CONFIG2); v &= ~CONFIG2_TEST_POWERDOWN; kxw(v, CONFIG2);
+-	v = kxr(CR_PARA_CON0); v |= CON0_CR_PARA_SEL; kxw(v, CR_PARA_CON0);
+-
+-	/* ROM mode: sram_bypass = 1, ext_ld_done = 0 */
+-	v = kxr(SRAM_CON);
+-	if (kx_rom) v |= SRAM_BYPASS; else v &= ~SRAM_BYPASS;   /* KX184: RAM mode = bypass 0 */
+-	v &= ~SRAM_EXT_LD_DONE;
+-	kxw(v, SRAM_CON);
+-	udelay(10);
+-	pr_debug("KXUDP initiate: CONFIG0=%08x CONFIG2=%08x CON0=%08x SRAM=%08x\n",
+-		kxr(CONFIG0), kxr(CONFIG2), kxr(CR_PARA_CON0), kxr(SRAM_CON));
+-}
+-
+-static void kx_ext_ld_done(int val)
+-{
+-	u32 v = kxr(SRAM_CON);
+-	if (val) v |= SRAM_EXT_LD_DONE; else v &= ~SRAM_EXT_LD_DONE;
+-	kxw(v, SRAM_CON);
+-	pr_debug("KXUDP sram_ext_ld_done(%d) -> SRAM_CON=%08x\n", val, kxr(SRAM_CON));
+-}
+-
+-static u16 kx_cr_read(u16 addr)
+-{
+-	u32 con0, con1 = 0;
+-	int i;
+-
+-	kx_cr_port_clear();
+-
+-	con0 = kxr(CR_PARA_CON0);
+-	con0 &= ~CON0_CR_PARA_ADDR(0xffff);
+-	con0 |= CON0_CR_PARA_ADDR(addr) | CON0_CR_PARA_CLK;
+-	writel(con0, ctrl + CR_PARA_CON0);
+-	con1 |= BIT(0);                       /* cr_para_rd_en */
+-	writel(con1, ctrl + CR_PARA_CON1);
+-	cr_clk(ctrl, 0);
+-	cr_clk(ctrl, 1);
+-	con1 &= ~BIT(0);
+-	writel(con1, ctrl + CR_PARA_CON1);
+-	cr_clk(ctrl, 0);
+-	for (i = 0; i < 10; i++) {
+-		cr_clk(ctrl, 1);
+-		if (kxr(CR_PARA_CON0) & CON0_CR_PARA_ACK) break;
+-		cr_clk(ctrl, 0);
+-	}
+-	if (i >= 10) kx_ackmiss++;            /* KX180: read never acked */
+-	/* THE FIX: drop the clock BEFORE latching the data register.
+-	 * The vendor's cr_read ends with cr_clk_low() then reads CR_PARA_CON1;
+-	 * reading it with the clock still high returns zero. */
+-	cr_clk(ctrl, 0);
+-	return (u16)(kxr(CR_PARA_CON1) >> 16);
+-}
+-
+-/* step 6 (simplified): wait for RX calibration done - vendor's additional_cr_reg_update */
+-static int kx_cal_poll(void)
+-{
+-	u16 v = 0;
+-	int i;
+-	for (i = 0; i < 100; i++) {
+-		v = kx_cr_read(CRREG_LANE_RX(0x303e));
+-		if (v & 0x2) break;
+-		mdelay(1);
+-	}
+-	pr_debug("KXUDP cal: CR[0x%04x]=%04x after %d tries%s\n", CRREG_LANE_RX(0x303e), v, i,
+-		(i >= 100) ? "  *** NOT CHECK CAL DONE ***" : "");
+-	return (i >= 100) ? -1 : 0;
+-}
+-
+-/* step 7: NC -> USB sync mode, via the TCA block at 0x10ae0000 */
+-static int kx_nc2usb_mode(void)
+-{
+-	u32 reg;
+-	int i;
+-
+-	if (!tca) { pr_warn("KXUDP nc2usb: no tca mapping\n"); return -1; }
+-
+-	writel(0xffff, tca + TCA_INTR_STS);
+-	reg = readl(tca + TCA_INTR_EN);
+-	reg |= TCA_INTR_XA_ACK_EN | TCA_INTR_XA_TO_EN;
+-	writel(reg, tca + TCA_INTR_EN);
+-
+-	reg = readl(tca + TCA_TCPC);
+-	reg &= ~(TCPC_MUX_MASK | TCPC_ORIENT | TCPC_LOW_POWER);
+-	reg |= TCPC_MUX_USB31 | TCPC_VALID;
+-	writel(reg, tca + TCA_TCPC);
+-	pr_debug("KXUDP nc2usb: TCPC=%08x (mux=USB31, valid=1)\n", readl(tca + TCA_TCPC));
+-
+-	for (i = 1000; i > 0; --i) {
+-		if (readl(tca + TCA_INTR_STS) & TCA_STS_XA_ACT)
+-			break;
+-		udelay(1);
+-	}
+-	pr_debug("KXUDP nc2usb: xa_act after %d tries, INTR_STS=%08x%s\n",
+-		1000 - i, readl(tca + TCA_INTR_STS), (i <= 0) ? "  *** TCA TIMEOUT ***" : "");
+-	if (i <= 0) return -1;
+-
+-	writel(0xffff, tca + TCA_INTR_STS);
+-	reg = readl(tca + TCA_INTR_EN);
+-	reg &= ~(TCA_INTR_XA_ACK_EN | TCA_INTR_XA_TO_EN);
+-	writel(reg, tca + TCA_INTR_EN);
+-	return 0;
+-}
+-
+-int kxusbdp_boot(void)
+-{
+-	kx_boots++;
+-	kx_qch_link_on();   /* KX187: vendor order - glue clocks before the PHY */
+-	u32 v;
+-	int i;
+-
+-	pr_info("KXUDP ===== SNPS USBDP combo PHY bring-up =====\n");
+-	if (kx_tca_only) {
+-		int rc;
+-
+-		pr_info("KXUDP ===== TCA-ONLY mode: no access to 0x10ad0000 =====\n");
+-		tca = ioremap(KX_TCA_BASE, 0x100);
+-		if (!tca) {
+-			pr_err("KXUDP tca ioremap failed\n");
+-			return -ENOMEM;
+-		}
+-		rc = kx_nc2usb_mode();
+-		pr_info("KXUDP TCA end: rc=%d\n", rc);
+-		return 0;
+-	}
+-	kx_step = 1;
+-	ctrl = ioremap(KX_CTRL_BASE, 0x200);
+-	if (!ctrl) { pr_err("KXUDP ioremap ctrl failed\n"); return -ENOMEM; }
+-	tca = ioremap(KX_TCA_BASE, 0x100);
+-	if (!tca) pr_warn("KXUDP ioremap tca failed (step 7 will be skipped)\n");
+-
+-	pr_debug("KXUDP before: RST=%08x CON0=%08x CON1=%08x CON2=%08x CFG0=%08x CFG2=%08x SRAM=%08x\n",
+-		kxr(RST_CTRL), kxr(CR_PARA_CON0), kxr(CR_PARA_CON1), kxr(CR_PARA_CON2),
+-		kxr(CONFIG0), kxr(CONFIG2), kxr(SRAM_CON));
+-
+-	kx_release_usbdp_isol();   /* KX181: vendor order - isolation off BEFORE phy_enable */
+-	kx_step = 2;
+-	/* 1. assert reset */
+-	kx_lane0_reset(1);
+-	kx_phy_reset(1);
+-
+-	kx_step = 3;
+-	/* 2. configure the MPLLA */
+-	kx_config_mplla();
+-
+-	kx_step = 4;
+-	/* 3. initiate */
+-	kx_phy_initiate();
+-
+-	/* 4. de-assert reset */
+-	udelay(20);
+-	kx_phy_reset(0);
+-	kx_lane0_reset(0);
+-
+-	/* 5. wait for sram_init_done, then release the SRAM-loaded FSMs */
+-	for (i = 0; i < 100; i++) {
+-		cr_clk(ctrl, 1); cr_clk(ctrl, 0);
+-		if (kxr(SRAM_CON) & SRAM_INIT_DONE)
+-			break;
+-		udelay(1);
+-	}
+-	pr_debug("KXUDP fw_update_done poll: %d cycles, SRAM=%08x\n", i, kxr(SRAM_CON));
+-	if (kx_rom) {
+-		kx_ext_ld_done(1);
+-
+-		/* KX178: vendor ROM-mode writes (phy_enable's #else branch) - never done by this module
+-		 * before.  Without them the Raw PCS never gets the VCO low-frequency override or the
+-		 * 0x63 tuning word the ROM code expects. */
+-		kx_cr_port_clear();
+-		kx_cr_write(CRREG_LANE_RX(0x30c5), 0x8000);
+-		kx_cr_write(CRREG_LANE_RX(0x3018), 0x0f00);
+-		kx_cr_read(CRREG_LANE_RX(0x3018));
+-		kx_cr_read(0x0063);
+-		kx_cr_write(0x0063, 0x021f);
+-		kx_cr_read(0x0063);
+-		pr_info("KXUDP KX178 rom-mode writes done (0x30c5, 0x3018, 0x63)\n");
+-	} else {
+-		/* KX184: vendor RAM mode - VCO low-freq override, SRAM firmware, then ext_ld_done */
+-		uint am0, n;
+-		kx_cr_write(0x31c5, 0x8000);
+-		kx_cr_write(0x32c5, 0x8000);
+-		am0 = kx_ackmiss;
+-		for (n = 0; n < ARRAY_SIZE(kx_fw_code); n++)
+-			kx_cr_write(kx_fw_code[n][0], kx_fw_code[n][1]);
+-		kx_fwn = n;
+-		kx_am_fw = kx_ackmiss - am0;
+-		/* vendor phy_exynos_snps_usbdp_phy_sram_ext_ld_done(1) */
+-		cr_clk(ctrl, 1);
+-		kxw(kxr(SRAM_CON) | SRAM_EXT_LD_DONE, SRAM_CON);
+-		cr_clk(ctrl, 0);
+-		for (n = 0; n < 2000; n++) {
+-			int t;
+-			for (t = 0; t < 8; t++) { cr_clk(ctrl, 1); cr_clk(ctrl, 0); }
+-			if (kxr(SRAM_CON) & SRAM_INIT_DONE) break;
+-		}
+-		kx_ldwait = (n < 2000) ? n : 0xffff;
+-		pr_info("KXUDP KX184 ram-mode: fw=%u am_fw=%u ldwait=%u SRAM=%08x\n", kx_fwn, kx_am_fw, kx_ldwait, kxr(SRAM_CON));
+-	}
+-
+-	/* clear the CR port once before any access, and show its state */
+-	kx_cr_port_clear();
+-	pr_debug("KXUDP cr port cleared: CON0=%08x (ack must be 0)\n", kxr(CR_PARA_CON0));
+-
+-	pr_debug("KXUDP lane: phy_port=%d RX base=0x%04x TX base=0x%04x\n",
+-		kx_phy_port, CRREG_LANE_RX(0x0000), CRREG_LANE_TX(0x0000));
+-
+-	kx_step = 5;
+-	/* 6. CR update - wait for RX calibration */
+-	{
+-		int kx_cal_rc = kx_cal_poll();
+-		u16 kx_cal, kx_pma, kx_pcs, kx_fw0, kx_fw1, kx_tx;
+-
+-		kx_cal = kx_cr_read(CRREG_LANE_RX(0x303e));
+-		kx_pma = kx_cr_read(0x003d);
+-		kx_pcs = kx_cr_read(0x2010);
+-		kx_fw0 = kx_cr_read(0x2011);
+-		kx_fw1 = kx_cr_read(0x2012);
+-
+-		/* KX178: vendor additional_cr_reg_update() tail - TX VSWING plus the s5e9925 EVT0
+-		 * P1/P2 AFE block power tables (the vendor guards these with CONFIG_SOC_S5E9925,
+-		 * i.e. this SoC needs them and this module never wrote them). */
+-		kx_tx = kx_cr_read(0x0022);
+-		kx_tx &= ~(0x7 << 4);
+-		kx_tx |= (1 << 7) | (0x7 << 4);
+-		kx_cr_write(0x0022, kx_tx);
+-
+-		kx_cr_write(CRREG_LANE_TX(0x10eb),
+-			    kx_cr_read(CRREG_LANE_TX(0x10eb)) | (1 << 3) | (0x3 << 1));
+-		kx_cr_write(CRREG_LANE_RX(0x1042), 0x0203);
+-		kx_cr_write(CRREG_LANE_RX(0x1043), 0x0181);
+-
+-		kx_rc = (uint)kx_cal_rc;
+-		kx_publish(kx_cal, kx_pma, kx_pcs, kx_fw0, kx_fw1);
+-		/* KX180 */
+-		kx_id0 = kx_cr_read(0x0000); kx_id1 = kx_cr_read(0x0001);
+-		kx_wexp = kx_tx; kx_wrb = kx_cr_read(0x0022);
+-		kx_rst = kxr(RST_CTRL); kx_cfg0 = kxr(CONFIG0); kx_cfg2 = kxr(CONFIG2);
+-		kx_sram = kxr(SRAM_CON); kx_con0 = kxr(CR_PARA_CON0); kx_con1 = kxr(CR_PARA_CON1);
+-		kx_step = 6;
+-		pr_info("KXUDP KX187 result: rc=%d cal=%04x pma=%04x pcs=%04x fw=%04x/%04x "
+-			"RST=%08x CFG0=%08x CFG2=%08x SRAM=%08x DP12=%08x CON0=%08x\n",
+-			kx_cal_rc, kx_cal, kx_pma, kx_pcs, kx_fw0, kx_fw1,
+-			kxr(RST_CTRL), kxr(CONFIG0), kxr(CONFIG2), kxr(SRAM_CON),
+-			kxr(DP_CONFIG12), kxr(CR_PARA_CON0));
+-	}
+-
+-	kx_step = 7;
+-	/* 7. NC -> USB sync mode */
+-	kx_tca_snap(kx_tca_pre);
+-	kx_tca_rc = kx_nc2usb_mode();
+-	kx_step = 8;
+-
+-	udelay(200);
+-	kx_tca_snap(kx_tca_post);
+-	pr_info("KXUDP KX191 tca rc=%d GEN pre=%08x post=%08x TCPC post=%08x PSTATE post=%08x VBUS post=%08x/%08x\n",
+-		kx_tca_rc, kx_tca_pre[7], kx_tca_post[7], kx_tca_post[4], kx_tca_post[6], kx_tca_post[8], kx_tca_post[9]);
+-
+-	pr_debug("KXUDP after : RST=%08x CON0=%08x CFG0=%08x CFG2=%08x SRAM=%08x\n",
+-		kxr(RST_CTRL), kxr(CR_PARA_CON0), kxr(CONFIG0), kxr(CONFIG2), kxr(SRAM_CON));
+-	pr_debug("KXUDP ===== done; ~0 so the module unloads after printing =====\n");
+-
+-	if (tca) iounmap(tca);
+-	iounmap(ctrl);
+-	return 0;   /* KX179b: stay loaded - kx_* parameters must remain readable from the init */
+-}
+-
+-static void __exit kxusbdp_exit(void) { }
+-
+-EXPORT_SYMBOL_GPL(kxusbdp_boot);
+-
+-static int __init kxusbdp_init(void)
+-{
+-	if (kx_defer) {
+-		pr_info("KXUDP KX185 deferred: boot will run from the PHY driver pipe3_init\n");
+-		return 0;
+-	}
+-	return kxusbdp_boot();
+-}
+-module_init(kxusbdp_init);
+-module_exit(kxusbdp_exit);
+-MODULE_LICENSE("GPL");
+-MODULE_DESCRIPTION("kexec payload: SNPS USBDP combo PHY bring-up (vendor sequence replay)");
+diff --git a/drivers/phy/samsung/phy-exynos2200-usbdp.c b/drivers/phy/samsung/phy-exynos2200-usbdp.c
+new file mode 100755
+index 000000000..c7b39fd86
+--- /dev/null
++++ b/drivers/phy/samsung/phy-exynos2200-usbdp.c
+@@ -0,0 +1,308 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Exynos 2200 (S5E9925) Synopsys USBDP combo PHY bring-up, USB mode.
++ *
++ * Follows the vendor phy_exynos_snps_usbdp_phy_enable() sequence (RAM mode):
++ * CR_PARA control port at 0x10ad0000, Type-C assist (TCA) block at 0x10ae0000.
++ * Called from the PIPE3 instance init of phy-exynos5-usbdrd; the DWC3 core
++ * soft reset needs the pipe clock that this PHY's PLL provides.
++ *
++ * TODO for upstream: take the bases, the PMU syscon and the Q-channel
++ * register from DT instead of fixed addresses.
++ */
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/mfd/syscon.h>
++#include <linux/of.h>
++#include <linux/printk.h>
++#include <linux/regmap.h>
++
++#define USBDP_CTRL_BASE		0x10ad0000UL
++#define USBDP_TCA_BASE		0x10ae0000UL
++#define CMU_HSI0_QCH_BASE	0x10a03000UL
++#define QCH_CON_S_LINK		0x64
++#define PMU_USBDP_PHY_CTRL	0x730
++
++/* CR_PARA control block */
++#define RST_CTRL		0x0000
++#define CR_PARA_CON0		0x0004
++#define CR_PARA_CON1		0x0008
++#define CR_PARA_CON2		0x000c
++#define CONFIG0			0x0100
++#define CONFIG2			0x0108
++#define SRAM_CON		0x0110
++#define DP_CONFIG12		0x0234
++
++#define RST_PHY_RESET		BIT(0)
++#define RST_PHY_RESET_OVRD_EN	BIT(1)
++#define RST_LANE0_RESET_N	BIT(4)
++#define RST_LANE0_RESET_N_OVRD	BIT(5)
++
++#define CON0_CR_PARA_SEL	BIT(0)
++#define CON0_CR_PARA_ACK	BIT(4)
++#define CON0_CR_PARA_CLK	BIT(8)
++#define CON0_CR_PARA_ADDR(a)	(((a) & 0xffff) << 16)
++#define CON1_CR_PARA_RD_EN	BIT(0)
++#define CON2_CR_PARA_WR_EN	BIT(0)
++#define CON2_CR_PARA_WR_DATA(d)	(((d) & 0xffff) << 16)
++
++#define CONFIG0_ANA_PWR_EN	BIT(1)
++#define CONFIG0_MPLLA_SSC_EN	BIT(21)
++#define CONFIG2_TEST_POWERDOWN	BIT(24)
++#define DP_TX_MPLL_EN_MASK	(0xf << 8)
++
++#define SRAM_BYPASS		BIT(0)
++#define SRAM_EXT_LD_DONE	BIT(1)
++#define SRAM_INIT_DONE		BIT(2)
++
++/* TCA */
++#define TCA_INTR_EN		0x0004
++#define TCA_INTR_STS		0x0008
++#define TCA_TCPC		0x0014
++#define TCA_INTR_XA_ACK_EN	BIT(0)
++#define TCA_INTR_XA_TO_EN	BIT(1)
++#define TCA_STS_XA_ACT		BIT(0)
++#define TCPC_MUX_MASK		(0x3 << 0)
++#define TCPC_MUX_USB31		(1 << 0)
++#define TCPC_ORIENT		BIT(2)
++#define TCPC_LOW_POWER		BIT(3)
++#define TCPC_VALID		BIT(4)
++
++/* lane-relative CR addresses, used_phy_port = 0 */
++#define CR_LANE_TX(r)		((u16)(r))
++#define CR_LANE_RX(r)		((u16)((r) + 0x0100))
++
++/* production S5E9925 RAM-mode firmware patch (vendor snps-usbdp-ram-code.h) */
++static const u16 usbdp_fw_code[][2] = {
++	{0xC005, 0x6044}, {0xC007, 0x04B3}, {0xC01B, 0x7000}, {0xC01C, 0x131A},
++	{0xC023, 0x7000}, {0xC024, 0x1324}, {0xD31A, 0x034B}, {0xD31B, 0x0001},
++	{0xD31C, 0x080F}, {0xD31D, 0x0020}, {0xD31E, 0x034D}, {0xD31F, 0xFFFF},
++	{0xD320, 0x080F}, {0xD321, 0xFFFF}, {0xD322, 0x7000}, {0xD323, 0x001D},
++	{0xD324, 0x080F}, {0xD325, 0x0020}, {0xD326, 0x034D}, {0xD327, 0xFFFF},
++	{0xD328, 0x080F}, {0xD329, 0xFFFF}, {0xD32A, 0x1B42}, {0xD32B, 0xA003},
++	{0xD32C, 0x7000}, {0xD32D, 0x002E}, {0xD32E, 0x7000}, {0xD32F, 0x0025},
++	{0xD330, 0x7FFF}, {0xD331, 0x7FFF},
++};
++
++static void __iomem *ctrl;
++
++static u32 rd(u32 off) { return readl(ctrl + off); }
++static void wr(u32 val, u32 off) { writel(val, ctrl + off); }
++static void rmw(u32 off, u32 clr, u32 set) { wr((rd(off) & ~clr) | set, off); }
++
++static void cr_clk(int high)
++{
++	rmw(CR_PARA_CON0, CON0_CR_PARA_CLK, high ? CON0_CR_PARA_CLK : 0);
++	udelay(1);
++}
++
++/* mandatory before every CR access: enter with ack low */
++static void cr_port_clear(void)
++{
++	int i;
++
++	wr(0, CR_PARA_CON1);
++	wr(0, CR_PARA_CON2);
++	wr(CON0_CR_PARA_SEL, CR_PARA_CON0);
++	for (i = 0; i < 100; i++) {
++		cr_clk(1);
++		cr_clk(0);
++		if (!(rd(CR_PARA_CON0) & CON0_CR_PARA_ACK))
++			break;
++	}
++	rmw(CR_PARA_CON0, CON0_CR_PARA_CLK, 0);
++}
++
++static int cr_wait_ack(void)
++{
++	int i;
++
++	for (i = 0; i < 10; i++) {
++		cr_clk(1);
++		if (rd(CR_PARA_CON0) & CON0_CR_PARA_ACK)
++			return 0;
++		cr_clk(0);
++	}
++	return -ETIMEDOUT;
++}
++
++static int cr_write(u16 addr, u16 data)
++{
++	u32 con2 = CON2_CR_PARA_WR_DATA(data) | CON2_CR_PARA_WR_EN;
++
++	cr_port_clear();
++	rmw(CR_PARA_CON0, CON0_CR_PARA_ADDR(0xffff), CON0_CR_PARA_ADDR(addr) | CON0_CR_PARA_CLK);
++	cr_clk(0);
++	wr(con2, CR_PARA_CON2);
++	cr_clk(1);
++	cr_clk(0);
++	wr(con2 & ~CON2_CR_PARA_WR_EN, CR_PARA_CON2);
++	return cr_wait_ack();
++}
++
++static u16 cr_read(u16 addr)
++{
++	cr_port_clear();
++	rmw(CR_PARA_CON0, CON0_CR_PARA_ADDR(0xffff), CON0_CR_PARA_ADDR(addr) | CON0_CR_PARA_CLK);
++	wr(CON1_CR_PARA_RD_EN, CR_PARA_CON1);
++	cr_clk(0);
++	cr_clk(1);
++	wr(0, CR_PARA_CON1);
++	cr_clk(0);
++	cr_wait_ack();
++	/* the clock must be low before the data is latched */
++	cr_clk(0);
++	return (u16)(rd(CR_PARA_CON1) >> 16);
++}
++
++static void qch_link_on(void)
++{
++	void __iomem *c = ioremap(CMU_HSI0_QCH_BASE, 0x100);
++	u32 v;
++
++	if (!c)
++		return;
++	v = readl(c + QCH_CON_S_LINK);
++	if (!(v & BIT(0))) {		/* manual mode: CLOCK_REQ = 1 */
++		writel(v | BIT(1), c + QCH_CON_S_LINK);
++		udelay(10);
++	}
++	iounmap(c);
++}
++
++static int release_isolation(void)
++{
++	struct device_node *np;
++	struct regmap *pmu;
++	int ret;
++
++	np = of_find_compatible_node(NULL, NULL, "samsung,exynos2200-usb32drd-phy");
++	if (!np)
++		return -ENODEV;
++	pmu = syscon_regmap_lookup_by_phandle(np, "samsung,pmu-syscon");
++	of_node_put(np);
++	if (IS_ERR(pmu))
++		return PTR_ERR(pmu);
++	ret = regmap_update_bits(pmu, PMU_USBDP_PHY_CTRL, BIT(0), BIT(0));
++	udelay(50);
++	return ret;
++}
++
++static int tca_usb_mode(void __iomem *tca)
++{
++	int i;
++
++	writel(0xffff, tca + TCA_INTR_STS);
++	writel(readl(tca + TCA_INTR_EN) | TCA_INTR_XA_ACK_EN | TCA_INTR_XA_TO_EN,
++	       tca + TCA_INTR_EN);
++	writel((readl(tca + TCA_TCPC) & ~(TCPC_MUX_MASK | TCPC_ORIENT | TCPC_LOW_POWER)) |
++	       TCPC_MUX_USB31 | TCPC_VALID, tca + TCA_TCPC);
++	for (i = 1000; i > 0; --i) {
++		if (readl(tca + TCA_INTR_STS) & TCA_STS_XA_ACT)
++			break;
++		udelay(1);
++	}
++	if (!i)
++		return -ETIMEDOUT;
++	writel(0xffff, tca + TCA_INTR_STS);
++	writel(readl(tca + TCA_INTR_EN) & ~(TCA_INTR_XA_ACK_EN | TCA_INTR_XA_TO_EN),
++	       tca + TCA_INTR_EN);
++	return 0;
++}
++
++int exynos2200_usbdp_boot(void)
++{
++	void __iomem *tca;
++	unsigned int n, t;
++	int ret, ackmiss = 0;
++	u16 cal = 0;
++
++	qch_link_on();
++
++	ctrl = ioremap(USBDP_CTRL_BASE, 0x300);
++	if (!ctrl)
++		return -ENOMEM;
++	tca = ioremap(USBDP_TCA_BASE, 0x100);
++	if (!tca) {
++		ret = -ENOMEM;
++		goto out_ctrl;
++	}
++
++	ret = release_isolation();
++	if (ret)
++		pr_warn("exynos2200-usbdp: PMU isolation release failed: %d\n", ret);
++
++	/* 1. assert PHY and lane 0 reset */
++	rmw(RST_CTRL, RST_LANE0_RESET_N | RST_LANE0_RESET_N_OVRD, 0);
++	rmw(RST_CTRL, 0, RST_PHY_RESET | RST_PHY_RESET_OVRD_EN);
++
++	/* 2. MPLLA: SSC on, DisplayPort TX PLLs off */
++	rmw(CONFIG0, 0, CONFIG0_MPLLA_SSC_EN);
++	rmw(DP_CONFIG12, DP_TX_MPLL_EN_MASK, 0);
++
++	/* 3. initiate: analog power, no test powerdown, CR port selected, RAM mode */
++	rmw(CONFIG0, 0, CONFIG0_ANA_PWR_EN);
++	rmw(CONFIG2, CONFIG2_TEST_POWERDOWN, 0);
++	rmw(CR_PARA_CON0, 0, CON0_CR_PARA_SEL);
++	rmw(SRAM_CON, SRAM_BYPASS | SRAM_EXT_LD_DONE, 0);
++	udelay(10);
++
++	/* 4. de-assert reset */
++	udelay(20);
++	rmw(RST_CTRL, RST_PHY_RESET, RST_PHY_RESET_OVRD_EN);
++	rmw(RST_CTRL, RST_LANE0_RESET_N_OVRD, RST_LANE0_RESET_N);
++
++	/* 5. SRAM init done, then the firmware patch and ext_ld_done */
++	for (n = 0; n < 100; n++) {
++		cr_clk(1);
++		cr_clk(0);
++		if (rd(SRAM_CON) & SRAM_INIT_DONE)
++			break;
++		udelay(1);
++	}
++	ackmiss += !!cr_write(0x31c5, 0x8000);
++	ackmiss += !!cr_write(0x32c5, 0x8000);
++	for (n = 0; n < ARRAY_SIZE(usbdp_fw_code); n++)
++		ackmiss += !!cr_write(usbdp_fw_code[n][0], usbdp_fw_code[n][1]);
++	cr_clk(1);
++	rmw(SRAM_CON, 0, SRAM_EXT_LD_DONE);
++	cr_clk(0);
++	for (n = 0; n < 2000; n++) {
++		for (t = 0; t < 8; t++) {
++			cr_clk(1);
++			cr_clk(0);
++		}
++		if (rd(SRAM_CON) & SRAM_INIT_DONE)
++			break;
++	}
++	cr_port_clear();
++
++	/* 6. RX calibration done, then the vendor additional CR updates */
++	for (n = 0; n < 100; n++) {
++		cal = cr_read(CR_LANE_RX(0x303e));
++		if (cal & 0x2)
++			break;
++		mdelay(1);
++	}
++	cr_write(0x0022, (cr_read(0x0022) & ~(0x7 << 4)) | BIT(7) | (0x7 << 4));
++	cr_write(CR_LANE_TX(0x10eb), cr_read(CR_LANE_TX(0x10eb)) | BIT(3) | (0x3 << 1));
++	cr_write(CR_LANE_RX(0x1042), 0x0203);
++	cr_write(CR_LANE_RX(0x1043), 0x0181);
++	pr_info("exynos2200-usbdp: cal=%04x fw=%04x/%04x ackmiss=%d%s\n", cal,
++		cr_read(0x2011), cr_read(0x2012), ackmiss,
++		(cal & 0x2) ? "" : " (calibration not done)");
++
++	/* 7. Type-C assist: NC -> USB 3.1 */
++	ret = tca_usb_mode(tca);
++	udelay(200);
++	if (ret)
++		pr_err("exynos2200-usbdp: TCA USB mode switch timed out\n");
++
++	iounmap(tca);
++out_ctrl:
++	iounmap(ctrl);
++	ctrl = NULL;
++	return ret;
++}
+diff --git a/drivers/phy/samsung/phy-exynos5-usbdrd.c b/drivers/phy/samsung/phy-exynos5-usbdrd.c
+index 07e83d47b..dad36ca9c 100644
+--- a/drivers/phy/samsung/phy-exynos5-usbdrd.c
++++ b/drivers/phy/samsung/phy-exynos5-usbdrd.c
+@@ -1330,12 +1330,12 @@ static void exynos2200_usbdrd_utmi_init(struct exynos5_usbdrd_phy *phy_drd)
+ 	iounmap(rst);
+ }
+ 
+-/* SNPS USBDP combo PHY (RAM-mode SRAM firmware) bring-up, drivers/phy/samsung/kxusbdp.c */
+-extern int kxusbdp_boot(void);
++/* SNPS USBDP combo PHY (RAM-mode SRAM firmware) bring-up, phy-exynos2200-usbdp.c */
++int exynos2200_usbdp_boot(void);
+ 
+ static void exynos2200_usbdrd_pipe3_init(struct exynos5_usbdrd_phy *phy_drd)
+ {
+-	int ret = kxusbdp_boot();
++	int ret = exynos2200_usbdp_boot();
+ 
+ 	if (ret)
+ 		dev_err(phy_drd->dev, "USBDP combo PHY boot failed: %d\n", ret);
+-- 
+2.53.0
+

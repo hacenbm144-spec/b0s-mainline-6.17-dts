@@ -1,0 +1,310 @@
+From 4f60874252d59d4068481f5c6ac33f02f2602b7f Mon Sep 17 00:00:00 2001
+From: hacen <hacenbm144@gmail.com>
+Date: Fri, 9 Oct 2026 17:15:23 +0000
+Subject: [PATCH 5/9] soc: samsung: b0s kexec boot: PMIC rail restore via ACPM,
+ DPU takeover
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015Zi6dy8kB9rd8PzqHkWkui
+---
+ drivers/soc/samsung/Makefile      |   1 +
+ drivers/soc/samsung/kx-b0s-boot.c | 278 ++++++++++++++++++++++++++++++
+ 2 files changed, 279 insertions(+)
+ create mode 100755 drivers/soc/samsung/kx-b0s-boot.c
+
+diff --git a/drivers/soc/samsung/Makefile b/drivers/soc/samsung/Makefile
+index 248a33d77..807bd9e4e 100644
+--- a/drivers/soc/samsung/Makefile
++++ b/drivers/soc/samsung/Makefile
+@@ -13,3 +13,4 @@ obj-$(CONFIG_EXYNOS_PMU_ARM_DRIVERS)	+= exynos3250-pmu.o exynos4-pmu.o \
+ obj-$(CONFIG_EXYNOS_REGULATOR_COUPLER) += exynos-regulator-coupler.o
+ 
+ obj-$(CONFIG_SAMSUNG_PM_CHECK)	+= s3c-pm-check.o
++obj-$(CONFIG_ARCH_EXYNOS)	+= kx-b0s-boot.o
+diff --git a/drivers/soc/samsung/kx-b0s-boot.c b/drivers/soc/samsung/kx-b0s-boot.c
+new file mode 100755
+index 000000000..4e39158e7
+--- /dev/null
++++ b/drivers/soc/samsung/kx-b0s-boot.c
+@@ -0,0 +1,278 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * kx-b0s-boot - built-in bring-up helpers for the Samsung Galaxy S22 Ultra (b0s, Exynos 2200)
++ * when mainline Linux is started by kexec from the stock Android kernel (k1b230).
++ *
++ * Bench code, NOT upstream material: fixed addresses, no DT bindings. It replaces the out-of-tree
++ * kxpmic.ko (k1b228) and kxdpu.ko (k1b222) with identical logic, run at fixed initcall levels:
++ *
++ *  subsys_initcall  kx_b0s_pmic: ACPM (APM SRAM 0x02060000 + initdata 0xF800, channel 2, doorbell
++ *                   BIT(2) << 16 -> 0x15900008) - whitelist of six PMIC rails; per rail the voltage
++ *                   field must equal Android's, then ONLY the enable field [7:6] is set to 0b11.
++ *                   Android's kexec shutdown clears the UFS LDO18/19 enables (VCC 2.55 V / VCCQ 1.2 V);
++ *                   the USB rails stay on. Runs before any driver probe, so UFS finds its supplies on.
++ *  late_initcall_sync kx_b0s_dpu: the DPU left running by the host (kxdispkeep + kxdpuwake4) is pointed at
++ *                   the simple-framebuffer at PA 0xD0000000 through our own sysmmu table at 0xD1F00000
++ *                   (DQE + CGC EDMA off, full-screen window auto-detected, ARGB8888 linear, COPY blend).
++ * Both only run on "samsung,b0s".
++ */
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/of.h>
++#include <linux/delay.h>
++#include <linux/ktime.h>
++#include <linux/string.h>
++
++/* ------------------------------------------------------------------ PMIC via ACPM */
++#define SRAM_PA		0x02060000
++#define SRAM_SZ		0x50000
++#define INITDATA	0xF800
++#define MBOX_PA		0x15900000
++#define MBOX_INTGR0	0x08
++#define ACPM_CH		2
++#define PMIC_BANK	5
++
++struct kx_rail { const char *name; u8 sid, en, low, vreg, vval; };
++static const struct kx_rail kx_rails[] __initconst = {
++	{ "LDO18 ufs_vcc",  0, 0xC9, 0x1E, 0,    0    },
++	{ "LDO19 ufs_vccq", 0, 0xCA, 0x12, 0xCB, 0x90 },
++	{ "LDO5 usb075",    0, 0xB4, 0x12, 0xB5, 0x48 },
++	{ "LDO7 usb12",     0, 0xB8, 0x12, 0xB9, 0x90 },
++	{ "LDO20 usb18",    0, 0xCC, 0x20, 0,    0    },
++	{ "LDO16 usb33",    1, 0xEB, 0x34, 0,    0    },
++};
++
++static void __iomem *kx_sram, *kx_mbox;
++static u32 kx_qlen, kx_mlen, kx_txr, kx_txf, kx_txb, kx_rxr, kx_rxf, kx_rxb;
++static u8 kx_seq;
++
++static int __init kx_acpm_xfer(u8 sid, u8 reg, bool write, u8 wval, u8 *rval)
++{
++	void __iomem *txf = kx_sram + kx_rxf, *txb = kx_sram + kx_rxb;
++	void __iomem *rxr = kx_sram + kx_txr, *rxf = kx_sram + kx_txf, *rxb = kx_sram + kx_txb;
++	u32 cmd[4] = { 0 }, front, idx, r, f, w0, w1;
++	ktime_t to;
++
++	if (++kx_seq >= 64)
++		kx_seq = 1;
++	cmd[0] = ((u32)kx_seq << 16) | ((u32)PMIC_BANK << 8) | reg;
++	cmd[1] = ((u32)(sid & 0xF) << 24) | (write ? (((u32)wval << 8) | 1) : 0);
++	cmd[3] = (u32)ktime_to_ms(ktime_get());
++	front = readl(txf);
++	idx = (front + 1) % kx_qlen;
++	__iowrite32_copy(txb + kx_mlen * front, cmd, 4);
++	writel(idx, txf);
++	writel(BIT(ACPM_CH) << 16, kx_mbox + MBOX_INTGR0);
++	to = ktime_add_ms(ktime_get(), 100);
++	do {
++		r = readl(rxr);
++		f = readl(rxf);
++		while (r != f) {
++			w0 = readl(rxb + kx_mlen * r);
++			w1 = readl(rxb + kx_mlen * r + 4);
++			r = (r + 1) % kx_qlen;
++			writel(r, rxr);
++			if (((w0 >> 16) & 0x3f) == kx_seq) {
++				if (rval)
++					*rval = (w1 >> 8) & 0xff;
++				return (w1 >> 24) & 0xff;
++			}
++		}
++		udelay(20);
++	} while (ktime_before(ktime_get(), to));
++	return -ETIMEDOUT;
++}
++
++static int __init kx_b0s_pmic(void)
++{
++	u32 chans, nch, i;
++	void __iomem *c;
++	int on = 0;
++
++	if (!of_machine_is_compatible("samsung,b0s"))
++		return 0;
++	kx_sram = ioremap(SRAM_PA, SRAM_SZ);
++	kx_mbox = ioremap(MBOX_PA, 0x1000);
++	if (!kx_sram || !kx_mbox)
++		goto out;
++	chans = readl(kx_sram + INITDATA + 8);
++	nch = readl(kx_sram + INITDATA + 24);
++	if (!chans || chans >= SRAM_SZ || nch > 32 || ACPM_CH >= nch)
++		goto bad;
++	for (i = 0; i < nch; i++) {
++		c = kx_sram + chans + i * 72;
++		if (readl(c) != ACPM_CH)
++			continue;
++		kx_rxr = readl(c + 16); kx_rxf = readl(c + 20); kx_rxb = readl(c + 24);
++		kx_txr = readl(c + 40); kx_txf = readl(c + 44); kx_txb = readl(c + 48);
++		kx_qlen = readl(c + 52); kx_mlen = readl(c + 56);
++		break;
++	}
++	if (!kx_qlen || kx_qlen > 64 || kx_mlen < 16 || kx_mlen > 64 || kx_rxb >= SRAM_SZ || kx_txb >= SRAM_SZ)
++		goto bad;
++
++	for (i = 0; i < ARRAY_SIZE(kx_rails); i++) {
++		const struct kx_rail *rl = &kx_rails[i];
++		u8 en = 0, vs = 0, after = 0;
++		int ret, w = 0;
++
++		ret = kx_acpm_xfer(rl->sid, rl->en, false, 0, &en);
++		if (!ret && rl->vreg)
++			ret = kx_acpm_xfer(rl->sid, rl->vreg, false, 0, &vs);
++		if (ret) {
++			pr_err("kx-b0s: pmic %s read failed (%d) - skipped\n", rl->name, ret);
++			continue;
++		}
++		if ((en & 0x3f) != rl->low || (rl->vreg && vs != rl->vval)) {
++			pr_err("kx-b0s: pmic %s en=%#04x vsel=%#04x differs from Android - NOT written\n", rl->name, en, vs);
++			continue;
++		}
++		if ((en & 0xc0) != 0xc0)
++			w = kx_acpm_xfer(rl->sid, rl->en, true, (en & 0x3f) | 0xc0, NULL);
++		udelay(300);
++		kx_acpm_xfer(rl->sid, rl->en, false, 0, &after);
++		pr_info("kx-b0s: pmic %-14s sid%u %#04x: %#04x -> %#04x (w %d)%s\n", rl->name, rl->sid, rl->en, en,
++			after, w, (after & 0xc0) == 0xc0 ? " ON" : " NOT ON");
++		if ((after & 0xc0) == 0xc0)
++			on++;
++	}
++	pr_info("kx-b0s: pmic %d/%zu rails on\n", on, ARRAY_SIZE(kx_rails));
++	mdelay(20);
++	goto out;
++bad:
++	pr_err("kx-b0s: ACPM channel table implausible - nothing sent\n");
++out:
++	if (kx_mbox)
++		iounmap(kx_mbox);
++	if (kx_sram)
++		iounmap(kx_sram);
++	return 0;
++}
++subsys_initcall(kx_b0s_pmic);
++
++/* ------------------------------------------------------------------ DPU -> simple-framebuffer */
++#define PMU_PD_DPUB_ST	0x15862084
++#define PMU_PD_DPUF_ST	0x15862104
++#define DECON_MAIN	0x19F00000
++#define DECON_WIN	0x19F10000
++#define DECON_WINCON	0x19F30000
++#define DQE_EDMA	0x1AD0E000
++#define FB_PA		0xD0000000UL
++#define DUMMY_PA	0xD1E00000UL
++#define FLPT_PA		0xD1F00000UL
++#define FB_IOVA		0x10000000UL
++#define FB_W		1440
++#define FB_H		3088
++#define FB_NSEC		18
++
++static const unsigned long kx_mmus[] __initconst = { 0x1AC40000, 0x1AC50000, 0x1AE40000, 0x1AE50000 };
++
++static unsigned long __init kx_ch_dma(unsigned int ch)
++{
++	if (ch <= 7)
++		return 0x1AD00000 + ch * 0x1000;
++	if (ch <= 14)
++		return 0x1AF00000 + (ch - 8) * 0x1000;
++	if (ch == 15)
++		return 0x1AF07000;
++	return 0;
++}
++
++static u32 __init kx_rd(unsigned long pa)
++{
++	void __iomem *p = ioremap(pa, 4);
++	u32 v;
++
++	if (!p)
++		return 0xdeadbeef;
++	v = readl(p);
++	iounmap(p);
++	return v;
++}
++
++static void __init kx_wr(unsigned long pa, u32 v)
++{
++	void __iomem *p = ioremap(pa, 4);
++
++	if (!p)
++		return;
++	writel(v, p);
++	iounmap(p);
++}
++
++static int __init kx_b0s_dpu(void)
++{
++	u32 *flpt, dpc, con, s, e;
++	void *dummy;
++	unsigned long d = 0;
++	int i, win = -1, ch = -1;
++
++	if (!of_machine_is_compatible("samsung,b0s"))
++		return 0;
++	if (kx_rd(PMU_PD_DPUB_ST) != 1 || kx_rd(PMU_PD_DPUF_ST) != 1) {
++		pr_err("kx-b0s: dpu power domains off - display not taken over\n");
++		return 0;
++	}
++	dummy = memremap(DUMMY_PA, 0x100000, MEMREMAP_WC);
++	flpt = memremap(FLPT_PA, 4096 * 4, MEMREMAP_WC);
++	if (!dummy || !flpt) {
++		pr_err("kx-b0s: dpu memremap failed\n");
++		return 0;
++	}
++	memset(dummy, 0, 0x100000);
++	for (i = 0; i < 4096; i++)
++		flpt[i] = (u32)(DUMMY_PA >> 4) | 2;
++	for (i = 0; i < FB_NSEC; i++)
++		flpt[(FB_IOVA >> 20) + i] = (u32)((FB_PA + i * 0x100000UL) >> 4) | 2;
++	wmb();
++	memunmap(flpt);
++	memunmap(dummy);
++
++	kx_wr(DQE_EDMA + 0x0, 0);
++	dpc = kx_rd(DECON_MAIN + 0x200);
++	kx_wr(DECON_MAIN + 0x200, dpc & ~(0x7 << 12));
++
++	for (i = 0; i < ARRAY_SIZE(kx_mmus); i++) {
++		kx_wr(kx_mmus[i] + 0x800C, FLPT_PA >> 12);
++		kx_wr(kx_mmus[i] + 0x8010, 1);
++		kx_wr(kx_mmus[i] + 0x64, 0xFFFFFFFF);
++	}
++
++	for (i = 0; i < 16; i++) {
++		con = kx_rd(DECON_WINCON + i * 0x1000);
++		s = kx_rd(DECON_WIN + i * 0x1000 + 0xC);
++		e = kx_rd(DECON_WIN + i * 0x1000 + 0x10);
++		if ((con & 1) && s == 0 && e == (((FB_H - 1) << 16) | (FB_W - 1)) && win < 0) {
++			win = i;
++			ch = (con >> 4) & 0xF;
++		}
++	}
++	if (win < 0 || !(d = kx_ch_dma(ch))) {
++		pr_err("kx-b0s: dpu no enabled full-screen window found\n");
++		return 0;
++	}
++	for (i = 0; i < 16; i++)
++		if (i != win)
++			kx_wr(DECON_WINCON + i * 0x1000, 0);
++	kx_wr(d + 0x08, 0xFF400000);
++	kx_wr(d + 0x10, FB_W);
++	kx_wr(d + 0x14, FB_H);
++	kx_wr(d + 0x18, 0);
++	kx_wr(d + 0x1C, (FB_H << 16) | FB_W);
++	kx_wr(d + 0x40, FB_IOVA);
++	kx_wr(d + 0x04, 0x0FFB0001);
++	kx_wr(DECON_WIN + win * 0x1000 + 0x4, 0x00FF0100);
++	kx_wr(DECON_WINCON + win * 0x1000, ((u32)ch << 4) | 1);
++	kx_wr(DECON_MAIN + 0x224, 0x00FF0000);
++	kx_wr(DECON_MAIN + 0x228, 0);
++	kx_wr(DECON_MAIN + 0x50, 0x9000FFFF);
++	kx_wr(DECON_MAIN + 0x30, kx_rd(DECON_MAIN + 0x30) & ~(1 << 4));
++	mdelay(200);
++	pr_info("kx-b0s: dpu ON win%d ch%d frame=%u irq=%08x mmuint=%08x/%08x/%08x/%08x (DATA_PATH_CON %08x)\n",
++		win, ch, kx_rd(DECON_MAIN + 0x4), kx_rd(d + 0x4), kx_rd(kx_mmus[0] + 0x60), kx_rd(kx_mmus[1] + 0x60),
++		kx_rd(kx_mmus[2] + 0x60), kx_rd(kx_mmus[3] + 0x60), dpc);
++	return 0;
++}
++late_initcall_sync(kx_b0s_dpu);
+-- 
+2.53.0
+

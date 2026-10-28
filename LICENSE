@@ -1,0 +1,11 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+The device tree source and the kernel patch in patches/ are derivative works of
+the Linux kernel and are licensed GPL-2.0-only, matching the kernel they apply to.
+
+The documentation in docs/ is released under GPL-2.0-only as well, so the whole
+repository carries a single set of terms.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.

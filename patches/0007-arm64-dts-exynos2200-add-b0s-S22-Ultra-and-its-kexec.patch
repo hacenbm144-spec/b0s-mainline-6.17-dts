@@ -1,0 +1,436 @@
+From 85a8c556901ce73d6c7ab71b77bec4db0e99d436 Mon Sep 17 00:00:00 2001
+From: hacen <hacenbm144@gmail.com>
+Date: Fri, 9 Oct 2026 17:58:25 +0000
+Subject: [PATCH 7/9] arm64: dts: exynos2200: add b0s (S22 Ultra) and its
+ kexec-payload variant
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/arm64/boot/dts/exynos/Makefile           |   4 +-
+ .../boot/dts/exynos/exynos2200-b0s-kx.dts     | 166 +++++++++++++
+ arch/arm64/boot/dts/exynos/exynos2200-b0s.dts | 225 ++++++++++++++++++
+ 3 files changed, 394 insertions(+), 1 deletion(-)
+ create mode 100755 arch/arm64/boot/dts/exynos/exynos2200-b0s-kx.dts
+ create mode 100644 arch/arm64/boot/dts/exynos/exynos2200-b0s.dts
+
+diff --git a/arch/arm64/boot/dts/exynos/Makefile b/arch/arm64/boot/dts/exynos/Makefile
+index bdb9e9813..f01c02888 100644
+--- a/arch/arm64/boot/dts/exynos/Makefile
++++ b/arch/arm64/boot/dts/exynos/Makefile
+@@ -2,7 +2,9 @@
+ subdir-y += google
+ 
+ dtb-$(CONFIG_ARCH_EXYNOS) += \
+-	exynos2200-g0s.dtb		\
++	exynos2200-g0s.dtb \
++	exynos2200-b0s.dtb \
++	exynos2200-b0s-kx.dtb		\
+ 	exynos5433-tm2.dtb		\
+ 	exynos5433-tm2e.dtb		\
+ 	exynos7-espresso.dtb		\
+diff --git a/arch/arm64/boot/dts/exynos/exynos2200-b0s-kx.dts b/arch/arm64/boot/dts/exynos/exynos2200-b0s-kx.dts
+new file mode 100755
+index 000000000..a911629d6
+--- /dev/null
++++ b/arch/arm64/boot/dts/exynos/exynos2200-b0s-kx.dts
+@@ -0,0 +1,166 @@
++// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
++/*
++ * b0s 6.17 KEXEC PAYLOAD device tree (k1b series) = exynos2200-b0s.dts + what the
++ * 5.10 kexec bench proved on this exact device (k1a series, 2026-09-24..10-02):
++ *
++ *  psci method "hvc"   live /proc/device-tree/psci/method = hvc (Samsung UH at EL2);
++ *                      every bench payload used it. Mainline dtsi says smc.
++ *  local-timer-stop    on all three c2 states (k1a102: without it c2 + NO_HZ dies at
++ *                      53.8 s; with it survives). k1b01 also boots cpuidle.off=1.
++ *  reserved-memory     every FIXED-address carveout of the live DT, all no-map (the
++ *                      payload has no vendor drivers, so none of them is its to use),
++ *                      plus the EL2 lv3 guard page (k1a53-56). Dynamic (size/alloc)
++ *                      pools of the first kernel are plain RAM and are not carried.
++ *  ramoops             NOT here: cmdline ramoops.* at 0xffff0000 (outside every bank,
++ *                      ioremapped), identical to the bench so k1a_zone_read2.sh reads it.
++ */
++#include "exynos2200-b0s.dts"
++
++/ {
++	model = "Samsung Galaxy S22 Ultra (SM-S908B) kexec payload";
++
++	/delete-node/ reserved-memory;
++
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		kx_el2_lv3@8a7400000     { reg = <0x8 0xa7400000 0x0 0x400000>;  no-map; };
++		kaslr@8ffff000           { reg = <0x0 0x8ffff000 0x0 0x1000>;    no-map; };
++		el2_earlymem@9fec00000   { reg = <0x9 0xfec00000 0x0 0x1400000>; no-map; };
++		el2_code@c1400000        { reg = <0x0 0xc1400000 0x0 0x200000>;  no-map; };
++		abox_rmem@88d800000      { reg = <0x8 0x8d800000 0x0 0x2800000>; no-map; };
++		sgpu_rmem@8ff00000       { reg = <0x0 0x8ff00000 0x0 0xe0000>;   no-map; };
++		el3mon_reserve@bff80000  { reg = <0x0 0xbff80000 0x0 0x80000>;   no-map; };
++		ect_binary@90000000      { reg = <0x0 0x90000000 0x0 0x3a000>;   no-map; };
++		debug_snapshot@ff210000  { reg = <0x0 0xff210000 0x0 0xc30000>;  no-map; };
++		log_itmon@fffe0000       { reg = <0x0 0xfffe0000 0x0 0x20000>;   no-map; };
++		debug_kinfo@fcfff000     { reg = <0x0 0xfcfff000 0x0 0x1000>;    no-map; };
++		log_bcm@fbc00000         { reg = <0x0 0xfbc00000 0x0 0x400000>;  no-map; };
++		log_ppc@fc800000         { reg = <0x0 0xfc800000 0x0 0x100000>;  no-map; };
++		s2mpu_table@c1800000     { reg = <0x0 0xc1800000 0x0 0x600000>;  no-map; };
++		seclog_mem@c3000000      { reg = <0x0 0xc3000000 0x0 0x80000>;   no-map; };
++		gnss_rmem@8a1600000      { reg = <0x8 0xa1600000 0x0 0x600000>;  no-map; };
++		teegris_rmem@ed310000    { reg = <0x0 0xed310000 0x0 0x2000>;    no-map; };
++		cp_rmem@880000000        { reg = <0x8 0x80000000 0x0 0xd800000>; no-map; };
++		cp_rmem1@890000000       { reg = <0x8 0x90000000 0x0 0xe000000>; no-map; };
++		mfc_fw_rmem@8a2400000    { reg = <0x8 0xa2400000 0x0 0x800000>;  no-map; };
++		dnc_fw_mem@8a1c00000     { reg = <0x8 0xa1c00000 0x0 0x500000>;  no-map; };
++		wifi_msi_rmem@e7200000   { reg = <0x0 0xe7200000 0x0 0x1000>;    no-map; };
++		sec_rdx_bootdev@8b0000000 { reg = <0x8 0xb0000000 0x0 0xb600000>; no-map; };
++		secure_camera@96000000   { reg = <0x0 0x96000000 0x0 0x1ee0000>; no-map; };
++		sec_debug_next@91200000  { reg = <0x0 0x91200000 0x0 0x200000>;  no-map; };
++	};
++};
++
++&{/psci} {
++	method = "hvc";
++};
++
++&little_cpu_sleep {
++	local-timer-stop;
++};
++
++&big_cpu_sleep {
++	local-timer-stop;
++};
++
++&prime_cpu_sleep {
++	local-timer-stop;
++};
++
++/*
++ * k1b06: SError at 0.0769 s in exynos_arm64_init_clocks <- exynos2200_cmu_probe on cmu_vts
++ * (x2 = 0x15308000, inside cmu_vts @ 0x15300000). The Voice Trigger System block is powered off /
++ * owned by its own firmware after the 5.10 host shuts down; touching its registers is a bus error.
++ * pinctrl_vts @ 0x15320000 is in the same block and would probe next. Both off in the payload.
++ */
++&cmu_vts {
++	status = "disabled";
++};
++
++&pinctrl_vts {
++	status = "disabled";
++};
++
++/* ---- k1b235: everything the bench DTB (b0s-kx-k1b222.dtb) carried on top of this file ---- */
++
++/ {
++	chosen {
++		/* bench: a fixed seed so crng is ready before init (k1b11); a bootloader would supply one */
++		rng-seed = <0x13633ce6 0x3882c5a2 0xf71a2ce6 0x36095b2e 0x0ea0520a 0xace9fb5c 0x5d520cff 0xc1ee4c0d
++			    0x91e3d48c 0x6df185e5 0x5930ec18 0x5990dc88 0xd9099c31 0x8b6cdadb 0xf2f8012d 0x5f4f0449>;
++
++		/* the DPU scans out kx_fb (k1b221); simpledrm + fbcon draw into it */
++		framebuffer@d0000000 {
++			compatible = "simple-framebuffer";
++			reg = <0x0 0xd0000000 0x0 0x10f6800>;
++			width = <1440>;
++			height = <3088>;
++			stride = <5760>;
++			format = "a8r8g8b8";
++			status = "okay";
++		};
++	};
++
++	reserved-memory {
++		kx_fb@d0000000 { reg = <0x0 0xd0000000 0x0 0x2000000>; no-map; };
++	};
++};
++
++/* all 8 CPUs come up after kexec (k1a92) */
++&cpu2 {
++	/delete-property/ status;
++};
++
++&cpu3 {
++	/delete-property/ status;
++};
++
++&reg_dummy {
++	regulator-always-on;
++	regulator-boot-on;
++};
++
++&{/soc} {
++	ufs_phy: ufs-phy@11104000 {
++		compatible = "samsung,exynos2200-ufs-phy";
++		reg = <0x0 0x11104000 0x0 0x4000>;
++		reg-names = "phy-pma";
++		samsung,pmu-syscon = <&pmu_system_controller>;
++		#phy-cells = <0>;
++	};
++
++	ufs@11100000 {
++		compatible = "samsung,exynos2200-ufs";
++		reg = <0x0 0x11100000 0x0 0x200>,
++		      <0x0 0x11101100 0x0 0x200>,
++		      <0x0 0x11180000 0x0 0x8000>,
++		      <0x0 0x111a0000 0x0 0xa014>;
++		reg-names = "hci", "vs_hci", "unipro", "ufsp";
++		interrupts = <GIC_SPI 553 IRQ_TYPE_LEVEL_HIGH 0>;
++		clocks = <&cmu_ufs 2>, <&cmu_ufs 3>;
++		clock-names = "core_clk", "sclk_unipro_main";
++		freq-table-hz = <0 0>, <0 0>;
++		phys = <&ufs_phy>;
++		phy-names = "ufs-phy";
++		samsung,sysreg = <&syscon_ufs 0x700>;
++		status = "okay";
++	};
++};
++
++/* USB: reference clock for the DRD PHY, the USB3 (USBDP) instance, device mode */
++&usb32drd {
++	clocks = <&cmu_hsi0 5>, <&ext_26m>;
++	clock-names = "phy", "ref";
++};
++
++&usb_dwc3 {
++	dr_mode = "peripheral";
++	phys = <&usb32drd 0>, <&usb32drd 1>;
++	phy-names = "usb2-phy", "usb3-phy";
++	snps,dis_u2_susphy_quirk;
++	/delete-property/ usb-role-switch;
++	/delete-property/ role-switch-default-mode;
++};
+diff --git a/arch/arm64/boot/dts/exynos/exynos2200-b0s.dts b/arch/arm64/boot/dts/exynos/exynos2200-b0s.dts
+new file mode 100644
+index 000000000..dc5cd34ca
+--- /dev/null
++++ b/arch/arm64/boot/dts/exynos/exynos2200-b0s.dts
+@@ -0,0 +1,225 @@
++// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
++/*
++ * Samsung Galaxy S22 Ultra (b0s/SM-S908B) device tree source
++ *
++ * Derived from exynos2200-g0s.dts (Ivaylo Ivanov, 2025).
++ *
++ * EVERY b0s-specific value below was read off the LIVE device's
++ * /proc/device-tree on 2026-09-24, not copied from g0s and not guessed:
++ *
++ *   model                 "Samsung B0S board based on S5E9925"
++ *   memory banks          six, exact reg values from the live DT
++ *   debug UART            uart@11C40000 - the ONLY node carrying
++ *                         samsung,dbg-uart-baud / dbg-uart-ch / dbg-word-len,
++ *                         and one of only two with status = "okay"
++ *   fifo size             samsung,fifo-size = 0x100 = 256
++ *   baud                  samsung,dbg-uart-baud = 0x1c200 = 115200
++ *   word length           samsung,dbg-word-len = 8
++ *   reg-io-width          4
++ *   panel                 1440x3088 (from /sys/class/drm/../modes)
++ */
++
++/dts-v1/;
++#include "exynos2200.dtsi"
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++
++/ {
++	model = "Samsung Galaxy S22 Ultra (SM-S908B)";
++	compatible = "samsung,b0s", "samsung,exynos2200";
++	chassis-type = "handset";
++
++	chosen {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		stdout-path = &serial_0;
++
++		/*
++		 * NO simple-framebuffer node, deliberately.
++		 *
++		 * g0s reserves 1080*2340*4 at 0xf6200000. b0s boots the same
++		 * base (s3cfb.bootloaderfb=0xf6200000 in the stock cmdline)
++		 * but its panel is 1440x3088, and the bootloader's splash
++		 * geometry is NOT derivable from this device: there is no
++		 * reserved-memory node at 0xf6200000 in the live DT and no
++		 * fb0 sysfs node. Declaring a wrong width/height/stride would
++		 * have the kernel scribble outside the real buffer.
++		 *
++		 * Console here is the UART, which IS verified. Add simplefb
++		 * only once the real geometry is read from the bootloader.
++		 */
++	};
++
++	/*
++	 * RTC clock (XrtcXTI); external, must be 32.768 kHz.
++	 * TODO: remove once RTC is implemented as part of the PMIC driver.
++	 */
++	rtcclk: clock-rtcclk {
++		compatible = "fixed-clock";
++		clock-output-names = "rtcclk";
++		#clock-cells = <0>;
++		clock-frequency = <32768>;
++	};
++
++	gpio-keys {
++		compatible = "gpio-keys";
++
++		pinctrl-0 = <&key_volup>;
++		pinctrl-names = "default";
++
++		volup-key {
++			label = "Volume Up";
++			linux,code = <KEY_VOLUMEUP>;
++			gpios = <&gpa3 0 GPIO_ACTIVE_LOW>;
++			wakeup-source;
++		};
++	};
++
++	/*
++	 * Six banks, verbatim from the live DT. g0s merges its upper banks
++	 * into one entry; b0s is NOT merged here because the lower region is
++	 * genuinely fragmented (0x80000000, 0xc1400000, 0xe1300000) and
++	 * inventing a contiguous range would hand the kernel memory that the
++	 * carveouts actually own.
++	 */
++	memory@80000000 {
++		device_type = "memory";
++		reg = <0x0 0x80000000  0x0 0x36c00000>,
++		      <0x0 0xc1400000  0x0 0x1ec00000>,
++		      <0x0 0xe1300000  0x0 0x1ed00000>,
++		      <0x8 0x80000000  0x0 0x80000000>,
++		      <0x9 0x00000000  0x0 0x80000000>,
++		      <0x9 0x80000000  0x0 0x80000000>;
++	};
++
++	/* TODO: remove once PMIC is implemented */
++	reg_dummy: regulator-0 {
++		compatible = "regulator-fixed";
++		regulator-name = "dummy_reg";
++	};
++
++	reserved-memory {
++		#address-cells = <2>;
++		#size-cells = <2>;
++		ranges;
++
++		debug_kinfo_reserved: debug-kinfo-reserved@fcfff000 {
++			reg = <0x0 0xfcfff000 0x0 0x1000>;
++			no-map;
++		};
++
++		log_itmon: log-itmon@fffe0000 {
++			reg = <0x0 0xfffe0000 0x0 0x20000>;
++			no-map;
++		};
++	};
++};
++
++/*
++ * The debug UART.
++ *
++ * exynos2200.dtsi upstream contains NO uart/serial node at all - that is the
++ * root cause of the "A1 is console-silent" finding, and it is a SoC-level
++ * omission, not a board one. The node goes into /soc, which is an unlabelled
++ * simple-bus with #address-cells = <2>, #size-cells = <2>.
++ *
++ * Deliberately minimal: no clocks, no pinctrl. SBOOT has already configured
++ * and enabled this UART before the kernel runs, and earlycon is polled MMIO,
++ * so it produces output without any clock driver. mainline exynos2200 has no
++ * peric CMU node yet, so a clocks property here could only point at something
++ * that does not exist.
++ *
++ * Pair with:  earlycon=exynos4210,0x11c40000 keep_bootcon console=ttySAC0,115200
++ * keep_bootcon matters: if the full ttySAC0 probe fails for want of a clock,
++ * the boot console stays alive and you still see the failure.
++ */
++&{/soc} {
++	serial_0: serial@11c40000 {
++		compatible = "samsung,exynos4210-uart";
++		reg = <0x0 0x11c40000 0x0 0x100>;
++		samsung,uart-fifosize = <256>;
++		reg-io-width = <4>;
++		status = "okay";
++	};
++};
++
++&cmu_hsi0 {
++	clocks = <&xtcxo>,
++		 <&rtcclk>,
++		 <&cmu_top CLK_DOUT_CMU_HSI0_NOC>,
++		 <&cmu_top CLK_DOUT_CMU_HSI0_DPGTC>,
++		 <&cmu_top CLK_DOUT_CMU_HSI0_DPOSC>,
++		 <&cmu_top CLK_DOUT_CMU_HSI0_USB32DRD>;
++	clock-names = "oscclk", "rtcclk", "noc", "dpgtc", "dposc", "usb";
++};
++
++/*
++ * Inherited from g0s: cpu2/cpu3 fail to come up consistently and hang the
++ * boot later. Kept because it is an exynos2200 issue, not a g0s one, and a
++ * first b0s boot should not also be debugging SMP. Revisit with nr_cpus=1
++ * once there is a console.
++ */
++&cpu2 {
++	status = "fail";
++};
++
++&cpu3 {
++	status = "fail";
++};
++
++&ext_26m {
++	clock-frequency = <26000000>;
++};
++
++&ext_200m {
++	clock-frequency = <200000000>;
++};
++
++&mct_peris {
++	status = "okay";
++};
++
++&pinctrl_alive {
++	key_volup: key-volup-pins {
++		samsung,pins = "gpa3-0";
++		samsung,pin-function = <EXYNOS_PIN_FUNC_F>;
++		samsung,pin-pud = <EXYNOS_PIN_PULL_UP>;
++		samsung,pin-drv = <EXYNOS7_PIN_DRV_LV4>;
++	};
++};
++
++&ppi_cluster0 {
++	affinity = <&cpu0 &cpu1>;
++};
++
++&usb {
++	/* TODO: replace once PMIC is implemented */
++	vdd10-supply = <&reg_dummy>;
++	vdd33-supply = <&reg_dummy>;
++	status = "okay";
++};
++
++&usb32drd {
++	status = "okay";
++};
++
++&usb_dwc3 {
++	dr_mode = "otg";
++	usb-role-switch;
++	role-switch-default-mode = "peripheral";
++	maximum-speed = "high-speed";
++};
++
++&usb_hsphy {
++	/* TODO: replace once PMIC is implemented */
++	vdda12-supply = <&reg_dummy>;
++	vdd-supply = <&reg_dummy>;
++	status = "okay";
++};
++
++&xtcxo {
++	clock-frequency = <76800000>;
++};
+-- 
+2.53.0
+

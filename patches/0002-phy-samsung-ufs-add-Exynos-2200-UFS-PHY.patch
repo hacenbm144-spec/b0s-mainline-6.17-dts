@@ -1,0 +1,170 @@
+From 26b990c992f6246a20838814735d5e2dbe9b24f1 Mon Sep 17 00:00:00 2001
+From: hacen <hacenbm144@gmail.com>
+Date: Fri, 9 Oct 2026 17:15:20 +0000
+Subject: [PATCH 2/9] phy: samsung-ufs: add Exynos 2200 UFS PHY
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015Zi6dy8kB9rd8PzqHkWkui
+---
+ drivers/phy/samsung/Makefile             |   2 +-
+ drivers/phy/samsung/phy-exynos2200-ufs.c | 107 +++++++++++++++++++++++
+ drivers/phy/samsung/phy-samsung-ufs.c    |   4 +
+ drivers/phy/samsung/phy-samsung-ufs.h    |   1 +
+ 4 files changed, 113 insertions(+), 1 deletion(-)
+ create mode 100755 drivers/phy/samsung/phy-exynos2200-ufs.c
+
+diff --git a/drivers/phy/samsung/Makefile b/drivers/phy/samsung/Makefile
+index 342682638..14a541e8d 100644
+--- a/drivers/phy/samsung/Makefile
++++ b/drivers/phy/samsung/Makefile
+@@ -3,7 +3,7 @@ obj-$(CONFIG_PHY_EXYNOS_DP_VIDEO)	+= phy-exynos-dp-video.o
+ obj-$(CONFIG_PHY_EXYNOS_MIPI_VIDEO)	+= phy-exynos-mipi-video.o
+ obj-$(CONFIG_PHY_EXYNOS_PCIE)		+= phy-exynos-pcie.o
+ obj-$(CONFIG_PHY_SAMSUNG_UFS)		+= phy-exynos-ufs.o
+-phy-exynos-ufs-y			+= phy-gs101-ufs.o
++phy-exynos-ufs-y			+= phy-gs101-ufs.o phy-exynos2200-ufs.o
+ phy-exynos-ufs-y			+= phy-samsung-ufs.o
+ phy-exynos-ufs-y			+= phy-exynos7-ufs.o
+ phy-exynos-ufs-y			+= phy-exynosautov9-ufs.o
+diff --git a/drivers/phy/samsung/phy-exynos2200-ufs.c b/drivers/phy/samsung/phy-exynos2200-ufs.c
+new file mode 100755
+index 000000000..1ee79b738
+--- /dev/null
++++ b/drivers/phy/samsung/phy-exynos2200-ufs.c
+@@ -0,0 +1,107 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * UFS PHY driver data for Samsung Exynos 2200 (s5e9925) - b0s kexec bench port.
++ *
++ * Tables from the vendor s5e9925 ufs-cal.h init_cfg_evt1 (evt-ver 1, 38.4 MHz ref).
++ * Validated on hardware 2026-10-08 (k1b212): with the PHY out of PMU isolation the live
++ * Android-configured PMA registers equal every PMA entry below.
++ * Vendor byte offsets are converted to PHY_APB_ADDR() register indices (offset >> 2);
++ * TRSV lane 1 is +0x800 bytes = +0x200 registers (same as gs101).
++ */
++#include <linux/iopoll.h>
++#include "phy-samsung-ufs.h"
++
++#define EXYNOS2200_PHY_ISO_OFFSET	0x728	/* PMU: vendor DT ufs-phy-iso */
++#define EXYNOS2200_PHY_ISO_MASK		0x1
++#define EXYNOS2200_PHY_ISO_EN		BIT(0)
++#define EXYNOS2200_LANE_OFFSET		0x200	/* in registers (0x800 bytes) */
++#define EXYNOS2200_TRSV_CAL_DONE	0x31D	/* byte 0xC74: vendor PHY_EMB_CAL_WAIT */
++#define EXYNOS2200_CAL_DONE_BIT		BIT(0)
++
++#define X2200_COMN(o, v)	PHY_COMN_REG_CFG((o) >> 2, v, PWR_MODE_ANY)
++#define X2200_TRSV(o, v)	PHY_TRSV_REG_CFG_OFFSET((o) >> 2, v, PWR_MODE_ANY, EXYNOS2200_LANE_OFFSET)
++
++/* vendor init_cfg_evt1, PMA part, in vendor order */
++static const struct samsung_ufs_phy_cfg exynos2200_pre_init_cfg[] = {
++	X2200_COMN(0x140, 0x08),
++	X2200_COMN(0x00C, 0x34),
++	X2200_COMN(0x014, 0x31),
++	X2200_COMN(0x01C, 0x3E),
++	X2200_COMN(0x02C, 0x44),
++	X2200_COMN(0x030, 0xC4),
++	X2200_COMN(0x034, 0xC3),
++	X2200_COMN(0x03C, 0x88),
++	X2200_COMN(0x058, 0x1A),
++	X2200_COMN(0x064, 0x34),
++	X2200_COMN(0x074, 0x00),
++	X2200_COMN(0x11C, 0x04),
++	X2200_COMN(0x150, 0x88),
++	X2200_COMN(0x19C, 0x4C),
++	X2200_COMN(0x1A0, 0x4C),
++	X2200_COMN(0x114, 0x20),
++	X2200_COMN(0x118, 0x00),
++	X2200_TRSV(0x804, 0x00),
++	X2200_TRSV(0x808, 0x00),
++	X2200_TRSV(0x80C, 0x00),
++	X2200_TRSV(0x810, 0x18),
++	X2200_TRSV(0x814, 0xC0),
++	X2200_TRSV(0x81C, 0x1C),
++	X2200_TRSV(0xBB0, 0x8C),
++	X2200_TRSV(0x9F0, 0xD0),
++	X2200_TRSV(0xA04, 0x48),
++	X2200_TRSV(0xA20, 0xFA),
++	X2200_TRSV(0xA24, 0x60),
++	X2200_TRSV(0xBB8, 0x03),
++	X2200_TRSV(0x8D0, 0x30),
++	X2200_TRSV(0x8E4, 0x05),
++	X2200_TRSV(0x8F4, 0x05),
++	X2200_TRSV(0x934, 0x1A),
++	X2200_TRSV(0x938, 0x12),
++	X2200_TRSV(0x93C, 0x5E),
++	X2200_TRSV(0x964, 0x2A),
++	X2200_TRSV(0x980, 0x54),
++	X2200_TRSV(0x998, 0x54),
++	X2200_TRSV(0xAAC, 0x00),
++	X2200_TRSV(0xAB0, 0x00),
++	X2200_COMN(0x140, 0x0C),
++	X2200_COMN(0x140, 0x00),
++	END_UFS_PHY_CFG,
++};
++
++static const struct samsung_ufs_phy_cfg *exynos2200_ufs_phy_cfgs[CFG_TAG_MAX] = {
++	[CFG_PRE_INIT]		= exynos2200_pre_init_cfg,
++	[CFG_POST_INIT]		= NULL,	/* vendor post_init is UniPro-only (host driver) */
++	[CFG_PRE_PWR_HS]	= NULL,	/* vendor calib_of_hs_rate_* is UniPro-only */
++	[CFG_POST_PWR_HS]	= NULL,	/* post_calib_of_hs_rate_* is empty */
++};
++
++/* vendor PHY_EMB_CAL_WAIT: TRSV 0xC74 bit0 per lane */
++static int exynos2200_phy_wait_for_calibration(struct phy *phy, u8 lane)
++{
++	struct samsung_ufs_phy *ufs_phy = get_samsung_ufs_phy(phy);
++	u32 off = PHY_APB_ADDR(EXYNOS2200_TRSV_CAL_DONE + lane * EXYNOS2200_LANE_OFFSET);
++	u32 val;
++	int err;
++
++	err = readl_poll_timeout(ufs_phy->reg_pma + off, val,
++				 (val & EXYNOS2200_CAL_DONE_BIT), 40, 40000);
++	if (err)
++		dev_err(ufs_phy->dev, "KX213 lane %u: phy cal done timeout (0x%x = %08x)\n",
++			lane, off, val);
++	else
++		dev_info(ufs_phy->dev, "KX213 lane %u: phy cal done (0x%x = %08x)\n",
++			 lane, off, val);
++	return err;
++}
++
++const struct samsung_ufs_phy_drvdata exynos2200_ufs_phy = {
++	.cfgs = exynos2200_ufs_phy_cfgs,
++	.isol = {
++		.offset = EXYNOS2200_PHY_ISO_OFFSET,
++		.mask = EXYNOS2200_PHY_ISO_MASK,
++		.en = EXYNOS2200_PHY_ISO_EN,
++	},
++	.clk_list = NULL,
++	.num_clks = 0,
++	.wait_for_cal = exynos2200_phy_wait_for_calibration,
++};
+diff --git a/drivers/phy/samsung/phy-samsung-ufs.c b/drivers/phy/samsung/phy-samsung-ufs.c
+index f3cbe6b17..8172980fe 100644
+--- a/drivers/phy/samsung/phy-samsung-ufs.c
++++ b/drivers/phy/samsung/phy-samsung-ufs.c
+@@ -314,6 +314,10 @@ static int samsung_ufs_phy_probe(struct platform_device *pdev)
+ }
+ 
+ static const struct of_device_id samsung_ufs_phy_match[] = {
++	{
++		.compatible = "samsung,exynos2200-ufs-phy",
++		.data = &exynos2200_ufs_phy,
++	},
+ 	{
+ 		.compatible = "google,gs101-ufs-phy",
+ 		.data = &tensor_gs101_ufs_phy,
+diff --git a/drivers/phy/samsung/phy-samsung-ufs.h b/drivers/phy/samsung/phy-samsung-ufs.h
+index a28f14808..32f076d67 100644
+--- a/drivers/phy/samsung/phy-samsung-ufs.h
++++ b/drivers/phy/samsung/phy-samsung-ufs.h
+@@ -152,5 +152,6 @@ extern const struct samsung_ufs_phy_drvdata exynosautov9_ufs_phy;
+ extern const struct samsung_ufs_phy_drvdata exynosautov920_ufs_phy;
+ extern const struct samsung_ufs_phy_drvdata fsd_ufs_phy;
+ extern const struct samsung_ufs_phy_drvdata tensor_gs101_ufs_phy;
++extern const struct samsung_ufs_phy_drvdata exynos2200_ufs_phy;
+ 
+ #endif /* _PHY_SAMSUNG_UFS_ */
+-- 
+2.53.0
+

@@ -1,0 +1,165 @@
+From 360d8cefb12426f464c95e2fe6a4224778c5351b Mon Sep 17 00:00:00 2001
+From: hacen <hacenbm144@gmail.com>
+Date: Fri, 9 Oct 2026 17:15:21 +0000
+Subject: [PATCH 3/9] scsi: ufs: exynos: add Exynos 2200 variant
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015Zi6dy8kB9rd8PzqHkWkui
+---
+ drivers/ufs/host/ufs-exynos.c | 139 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 139 insertions(+)
+
+diff --git a/drivers/ufs/host/ufs-exynos.c b/drivers/ufs/host/ufs-exynos.c
+index f0adcd9dd..6397093d5 100644
+--- a/drivers/ufs/host/ufs-exynos.c
++++ b/drivers/ufs/host/ufs-exynos.c
+@@ -2183,7 +2183,146 @@ static const struct exynos_ufs_drv_data gs101_ufs_drvs = {
+ 	.suspend		= gs101_ufs_suspend,
+ };
+ 
++/* ---- KX213: Samsung Exynos 2200 (s5e9925, Galaxy S22 b0s) variant ---------------------------
++ * From the vendor s5e9925 ufs-cal tables (init_cfg_evt1 / post_init_cfg_evt1 / calib_of_hs_rate_*),
++ * which follow the same UniPro/PCS programming as gs101 except where marked.
++ * Kept deliberately minimal for a read-only first bring-up: no WriteBooster, no clock gating,
++ * no hibern8-with-clk-gating, no UFSPR/FMP programming (UFSPR_SECURE path).
++ */
++#define EXYNOS2200_MISC_MPHY_APBCLK_CAL	BIT(10)	/* HCI_MISC: 1 = PMA APB clock stopped */
++#define EXYNOS2200_SHARABLE		0x300000	/* sysreg_ufs 0x700 (vendor ufs-iocc) */
++
++static int exynos2200_ufs_drv_init(struct exynos_ufs *ufs)
++{
++	u32 misc = hci_readl(ufs, HCI_MISC);
++
++	/* Keep the M-PHY APB clock running: the vendor driver only ungates it around
++	 * each PMA access (pma_readl/pma_writel); a PMA access while it is stopped SErrors. */
++	hci_writel(ufs, misc & ~EXYNOS2200_MISC_MPHY_APBCLK_CAL, HCI_MISC);
++	dev_info(ufs->hba->dev, "KX213 exynos2200 drv_init: HCI_MISC %08x -> %08x\n",
++		 misc, hci_readl(ufs, HCI_MISC));
++
++	return exynos_ufs_shareability(ufs);
++}
++
++static int exynos2200_ufs_pre_link(struct exynos_ufs *ufs)
++{
++	struct ufs_hba *hba = ufs->hba;
++	int i;
++	u32 tx_line_reset_period, rx_line_reset_period;
++
++	rx_line_reset_period = (RX_LINE_RESET_TIME * ufs->mclk_rate) / NSEC_PER_MSEC;
++	tx_line_reset_period = (TX_LINE_RESET_TIME * ufs->mclk_rate) / NSEC_PER_MSEC;
++
++	unipro_writel(ufs, get_mclk_period_unipro_18(ufs), COMP_CLK_PERIOD);
++
++	ufshcd_dme_set(hba, UIC_ARG_MIB(0x200), 0x40);
++	ufshcd_dme_set(hba, UIC_ARG_MIB(0x202), 0x22);	/* vendor: 38.4 MHz ref (gs101 n/a) */
++
++	for_each_ufs_rx_lane(ufs, i) {
++		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(VND_RX_CLK_PRD, i),
++			       DIV_ROUND_UP(NSEC_PER_SEC, ufs->mclk_rate));
++		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(VND_RX_CLK_PRD_EN, i), 0x0);
++		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(VND_RX_LINERESET_VALUE2, i),
++			       (rx_line_reset_period >> 16) & 0xFF);
++		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(VND_RX_LINERESET_VALUE1, i),
++			       (rx_line_reset_period >> 8) & 0xFF);
++		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(VND_RX_LINERESET_VALUE0, i),
++			       (rx_line_reset_period) & 0xFF);
++		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x2f, i), 0x79);	/* vendor 0x79 (gs101 0x69) */
++		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x84, i), 0x1);
++		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x25, i), 0xf6);
++	}
++
++	for_each_ufs_tx_lane(ufs, i) {
++		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(VND_TX_CLK_PRD, i),
++			       DIV_ROUND_UP(NSEC_PER_SEC, ufs->mclk_rate));
++		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(VND_TX_CLK_PRD_EN, i), 0x02);
++		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(VND_TX_LINERESET_PVALUE2, i),
++			       (tx_line_reset_period >> 16) & 0xFF);
++		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(VND_TX_LINERESET_PVALUE1, i),
++			       (tx_line_reset_period >> 8) & 0xFF);
++		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(VND_TX_LINERESET_PVALUE0, i),
++			       (tx_line_reset_period) & 0xFF);
++		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x04, i), 1);
++		ufshcd_dme_set(hba, UIC_ARG_MIB_SEL(0x7F, i), 0);
++	}
++
++	ufshcd_dme_set(hba, UIC_ARG_MIB(0x200), 0x0);
++	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_LOCAL_TX_LCC_ENABLE), 0x0);
++	ufshcd_dme_set(hba, UIC_ARG_MIB(N_DEVICEID), 0x0);
++	ufshcd_dme_set(hba, UIC_ARG_MIB(N_DEVICEID_VALID), 0x1);
++	ufshcd_dme_set(hba, UIC_ARG_MIB(T_PEERDEVICEID), 0x1);
++	ufshcd_dme_set(hba, UIC_ARG_MIB(T_CONNECTIONSTATE), CPORT_CONNECTED);
++
++	dev_info(hba->dev, "KX213 exynos2200 pre_link done (mclk %lu)\n", ufs->mclk_rate);
++	return 0;
++}
++
++static int exynos2200_ufs_post_link(struct exynos_ufs *ufs)
++{
++	struct ufs_hba *hba = ufs->hba;
++
++	/* vendor post_init_cfg_evt1: PA_SaveConfigTime = 0x3e8 under debug mode */
++	exynos_ufs_enable_dbg_mode(hba);
++	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_SAVECONFIGTIME), 0x3e8);
++	exynos_ufs_disable_dbg_mode(hba);
++
++	dev_info(hba->dev, "KX213 exynos2200 post_link done\n");
++	return 0;
++}
++
++static int exynos2200_ufs_pre_pwr_change(struct exynos_ufs *ufs,
++					 struct ufs_pa_layer_attr *pwr)
++{
++	struct ufs_hba *hba = ufs->hba;
++
++	/* vendor calib_of_hs_rate_a/b (identical to gs101 apart from 0x15D4) */
++	ufshcd_dme_set(hba, UIC_ARG_MIB(0x15D4), 0x1);
++	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_PWRMODEUSERDATA0), 12000);
++	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_PWRMODEUSERDATA1), 32000);
++	ufshcd_dme_set(hba, UIC_ARG_MIB(PA_PWRMODEUSERDATA2), 16000);
++	unipro_writel(ufs, 8064, UNIPRO_DME_POWERMODE_REQ_LOCALL2TIMER0);
++	unipro_writel(ufs, 28224, UNIPRO_DME_POWERMODE_REQ_LOCALL2TIMER1);
++	unipro_writel(ufs, 20160, UNIPRO_DME_POWERMODE_REQ_LOCALL2TIMER2);
++	unipro_writel(ufs, 12000, UNIPRO_DME_POWERMODE_REQ_REMOTEL2TIMER0);
++	unipro_writel(ufs, 32000, UNIPRO_DME_POWERMODE_REQ_REMOTEL2TIMER1);
++	unipro_writel(ufs, 16000, UNIPRO_DME_POWERMODE_REQ_REMOTEL2TIMER2);
++
++	return 0;
++}
++
++static struct exynos_ufs_uic_attr exynos2200_uic_attr = {
++	.tx_trailingclks		= 0xff,
++	/* vendor DBG_SUITE1/2_ENABLE at unipro 0x39A8/0x39B4 = MIB 0x956A/0x956D (same as gs101) */
++	.pa_dbg_opt_suite1_val		= 0x90913C1C,
++	.pa_dbg_opt_suite1_off		= PA_GS101_DBG_OPTION_SUITE1,
++	.pa_dbg_opt_suite2_val		= 0xE01C115F,
++	.pa_dbg_opt_suite2_off		= PA_GS101_DBG_OPTION_SUITE2,
++};
++
++static const struct exynos_ufs_drv_data exynos2200_ufs_drvs = {
++	.uic_attr		= &exynos2200_uic_attr,
++	/* vendor: 'fixed-prdt-req_list-ocs' -> no PRDT_BYTE_GRAN / BROKEN_REQ_LIST_CLR / BROKEN_OCS_FATAL_ERROR */
++	.quirks			= UFSHCI_QUIRK_SKIP_RESET_INTR_AGGR |
++				  UFSHCI_QUIRK_SKIP_MANUAL_WB_FLUSH_CTRL |
++				  UFSHCD_QUIRK_SKIP_DEF_UNIPRO_TIMEOUT_SETTING,
++	.opts			= EXYNOS_UFS_OPT_SKIP_CONFIG_PHY_ATTR |
++				  EXYNOS_UFS_OPT_UFSPR_SECURE |
++				  EXYNOS_UFS_OPT_TIMER_TICK_SELECT |
++				  EXYNOS_UFS_OPT_BROKEN_AUTO_CLK_CTRL,	/* vendor: auto HCI clk ctrl off */
++	.iocc_mask		= EXYNOS2200_SHARABLE,
++	.drv_init		= exynos2200_ufs_drv_init,
++	.pre_link		= exynos2200_ufs_pre_link,
++	.post_link		= exynos2200_ufs_post_link,
++	.pre_pwr_change		= exynos2200_ufs_pre_pwr_change,
++};
++/* ---- end KX213 ------------------------------------------------------------------------------ */
++
++
+ static const struct of_device_id exynos_ufs_of_match[] = {
++	{ .compatible = "samsung,exynos2200-ufs",
++	  .data       = &exynos2200_ufs_drvs },
+ 	{ .compatible = "google,gs101-ufs",
+ 	  .data	      = &gs101_ufs_drvs },
+ 	{ .compatible = "samsung,exynos7-ufs",
+-- 
+2.53.0
+
