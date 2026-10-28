@@ -114,6 +114,31 @@ the S-Boot-compatible variant, and the device-tree ABI findings documented in
 Android device tree is included.** Every patch in `patches/` is authored by
 hacenbm144 and applies to vanilla Linux 6.17.
 
+## AI assistance disclosure
+
+This work was **developed with substantial assistance from an AI coding assistant**
+(DeepSeek Harness, a large-language-model agent). That assistance covered:
+
+- drafting and iterating the device tree sources and patches;
+- analysing boot failures and proposing the next diagnostic step;
+- writing the reverse-engineering scripts and the documentation in `docs/`.
+
+**What the AI did not do:** it had no access to the hardware. Every claim about
+this device was produced by running code on a physical Galaxy S22 Ultra —
+reading `/proc/device-tree`, booting kernels, flashing payloads, and observing
+where a boot stopped. The AI proposed; the hardware decided. Several of its
+proposals were wrong and are recorded as such in the campaign history.
+
+**Accountability:** every commit carries `Signed-off-by:` from a human
+(hacenbm144), who reviewed the content, tested it on hardware, and is
+responsible for it. Commits created with AI assistance also carry an
+`Assisted-by:` trailer.
+
+This disclosure is voluntary. It is included because a reviewer, a future
+maintainer, or anyone building on this work should know how it was produced,
+and because AI-assisted contributions are best cited plainly rather than
+left to be inferred.
+
 ## License
 
 GPL-2.0-only. See [LICENSE](LICENSE). The device trees and the patches are derivative works of the
