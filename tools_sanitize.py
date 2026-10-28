@@ -35,9 +35,6 @@ TEXT_NAMES = {"SERIES", "README", "LICENSE", "MAINTAINERS"}
 
 
 def iter_text_files(root):
-    # never rewrite this script: its own pattern strings would match
-    if p.name == 'tools_sanitize.py':
-        continue
     for p in sorted(root.rglob("*")):
         if not p.is_file() or ".git" in p.parts:
             continue
