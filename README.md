@@ -116,28 +116,34 @@ hacenbm144 and applies to vanilla Linux 6.17.
 
 ## AI assistance disclosure
 
-This work was **developed with substantial assistance from an AI coding assistant**
-(DeepSeek Harness, a large-language-model agent). That assistance covered:
+This work was **developed with substantial assistance from AI coding assistants**:
+**Anthropic's Claude** and **DeepSeek** (via the DeepSeek Harness agent). They
+worked across different phases of the campaign — kernel-module experimentation,
+register analysis, disassembly, documentation, and the repository assembly.
 
-- drafting and iterating the device tree sources and patches;
+The assistance covered:
+
+- drafting and iterating the device tree sources and the patch series;
 - analysing boot failures and proposing the next diagnostic step;
-- writing the reverse-engineering scripts and the documentation in `docs/`.
+- writing the experiment modules, the reverse-engineering scripts, and the
+  documentation in `docs/`.
 
 **What the AI did not do:** it had no access to the hardware. Every claim about
 this device was produced by running code on a physical Galaxy S22 Ultra —
 reading `/proc/device-tree`, booting kernels, flashing payloads, and observing
-where a boot stopped. The AI proposed; the hardware decided. Several of its
-proposals were wrong and are recorded as such in the campaign history.
+where a boot stopped. The AI proposed; the hardware decided. Several proposals
+were wrong, and the corrections are recorded in the campaign history rather
+than edited out — the retractions are part of the evidence.
 
 **Accountability:** every commit carries `Signed-off-by:` from a human
 (hacenbm144), who reviewed the content, tested it on hardware, and is
 responsible for it. Commits created with AI assistance also carry an
-`Assisted-by:` trailer.
+`Assisted-by:` trailer naming the assistant or assistants involved.
 
 This disclosure is voluntary. It is included because a reviewer, a future
 maintainer, or anyone building on this work should know how it was produced,
-and because AI-assisted contributions are best cited plainly rather than
-left to be inferred.
+and because AI-assisted contributions are best cited plainly rather than left
+to be inferred.
 
 ## License
 
