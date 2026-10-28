@@ -1,3 +1,24 @@
-*.dtb
-*.pp
+# editor / OS noise
+*~
+*.swp
+.DS_Store
+Thumbs.db
+
+# build outputs
 *.o
+*.cmd
+*.ko
+*.mod
+*.mod.c
+*.order
+Module.symvers
+*.dtb
+*.dtbo
+
+# local kernel trees, vendor images, firmware (never commit)
+linux-*/
+*.img
+*.bin
+
+# local logs
+*.log
