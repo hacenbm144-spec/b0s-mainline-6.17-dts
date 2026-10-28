@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /*
- * b0s 6.17 KEXEC PAYLOAD device tree (k1b series) = exynos2200-b0s.dts + what the
- * 5.10 kexec bench proved on this exact device (k1a series, 2026-09-24..10-02):
+ * b0s 6.17 KEXEC PAYLOAD device tree (k1b series)
+ *
+ * Derived from exynos2200-b0s.dts, which is itself derived from
+ * exynos2200-g0s.dts (Ivaylo Ivanov, 2025) and the mainline Exynos 2200 SoC
+ * infrastructure (exynos2200.dtsi, exynos2200-pinctrl.dtsi).
+ *
+ * This variant adds what the 5.10 kexec bench proved on this exact device
+ * (k1a series, 2026-09-24..10-02):
  *
  *  psci method "hvc"   live /proc/device-tree/psci/method = hvc (Samsung UH at EL2);
  *                      every bench payload used it. Mainline dtsi says smc.

@@ -99,6 +99,21 @@ outside this repository.
 
 Nothing here is a Samsung binary. No vendor modules, no firmware, no images — source only.
 
+## Credits
+
+The Exynos 2200 SoC infrastructure this work builds on — `exynos2200.dtsi`,
+`exynos2200-pinctrl.dtsi`, and the `g0s` (Galaxy S22+) reference board — is
+upstream work by **Ivaylo Ivanov** (2025). Both device trees here are derived
+from `exynos2200-g0s.dts` and inherit that infrastructure via `#include`.
+
+This repository adds the **`b0s` (Galaxy S22 Ultra) device-specific pieces**,
+the S-Boot-compatible variant, and the device-tree ABI findings documented in
+`docs/DT-ABI-FINDINGS.md`.
+
+**No code from any vendor kernel, Android kernel fork, or third-party
+Android device tree is included.** Every patch in `patches/` is authored by
+hacenbm144 and applies to vanilla Linux 6.17.
+
 ## License
 
 GPL-2.0-only. See [LICENSE](LICENSE). The device trees and the patches are derivative works of the
