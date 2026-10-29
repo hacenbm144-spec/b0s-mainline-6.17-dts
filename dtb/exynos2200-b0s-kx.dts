@@ -99,7 +99,7 @@
 			    0x91e3d48c 0x6df185e5 0x5930ec18 0x5990dc88 0xd9099c31 0x8b6cdadb 0xf2f8012d 0x5f4f0449>;
 
 		/* the DPU scans out kx_fb (k1b221); simpledrm + fbcon draw into it */
-		framebuffer@d0000000 {
+		kx_simplefb: framebuffer@d0000000 {
 			compatible = "simple-framebuffer";
 			reg = <0x0 0xd0000000 0x0 0x10f6800>;
 			width = <1440>;
@@ -111,7 +111,7 @@
 	};
 
 	reserved-memory {
-		kx_fb@d0000000 { reg = <0x0 0xd0000000 0x0 0x2000000>; no-map; };
+		kx_fb: kx_fb@d0000000 { reg = <0x0 0xd0000000 0x0 0x2000000>; no-map; };
 	};
 };
 
@@ -169,4 +169,51 @@
 	snps,dis_u2_susphy_quirk;
 	/delete-property/ usb-role-switch;
 	/delete-property/ role-switch-default-mode;
+};
+
+/* ---- k1b235: addresses the kernel used to hard-code ---- */
+
+/ {
+	chosen {
+		/*
+		 * kexec bring-up helpers (drivers/soc/samsung/kx-b0s-boot.c). Under /chosen so no
+		 * platform device claims these windows.
+		 */
+		kexec-boot@2060000 {
+			compatible = "samsung,b0s-kexec-boot";
+			reg = <0x0 0x02060000 0x0 0x50000>,
+			      <0x0 0x15900000 0x0 0x1000>,
+			      <0x0 0x19f00000 0x0 0x1000>,
+			      <0x0 0x19f10000 0x0 0x10000>,
+			      <0x0 0x19f30000 0x0 0x10000>,
+			      <0x0 0x1ad0e000 0x0 0x1000>,
+			      <0x0 0x1ad00000 0x0 0x8000>,
+			      <0x0 0x1af00000 0x0 0x8000>,
+			      <0x0 0x1ac40000 0x0 0x10000>,
+			      <0x0 0x1ac50000 0x0 0x10000>,
+			      <0x0 0x1ae40000 0x0 0x10000>,
+			      <0x0 0x1ae50000 0x0 0x10000>;
+			reg-names = "acpm-sram", "apm-mbox", "decon", "decon-win", "decon-wincon",
+				    "dqe-edma", "dpp-dma-a", "dpp-dma-b",
+				    "sysmmu0", "sysmmu1", "sysmmu2", "sysmmu3";
+			samsung,pmu-syscon = <&pmu_system_controller>;
+			memory-region = <&kx_fb>;
+			framebuffer = <&kx_simplefb>;
+		};
+	};
+};
+
+&{/soc} {
+	usbdp_phy: phy@10ad0000 {
+		compatible = "samsung,exynos2200-usbdp-phy";
+		reg = <0x0 0x10ad0000 0x0 0x1000>,
+		      <0x0 0x10ae0000 0x0 0x100>;
+		reg-names = "ctrl", "tca";
+		samsung,pmu-syscon = <&pmu_system_controller>;
+		samsung,cmu-hsi0 = <&cmu_hsi0>;
+	};
+};
+
+&usb32drd {
+	samsung,usbdp-phy = <&usbdp_phy>;
 };
